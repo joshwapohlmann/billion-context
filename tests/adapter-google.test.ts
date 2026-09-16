@@ -286,3 +286,50 @@ test("google emit*: text, tool call and completion frames carry the documented s
     const error = frameJson(adapter.emitError("upstream exploded"));
     assert.deepEqual(error, { error: { code: 500, message: "upstream exploded", status: "INTERNAL" } });
 });
+
+// Frames reach the client from two fields: `raw` on the streaming events, and
+// `chunk` on meta events — the settle replay of a buffered call chunk arrives as
+// a meta, so a collector that reads only `raw` sees none of it.
+function framesOf(events: ParsedStreamEvent[]): string[] {
+    const frames: string[] = [];
+    for (const e of events) {
+        if ("raw" in e && Buffer.isBuffer(e.raw)) frames.push(e.raw.toString("utf8"));
+        if ("chunk" in e && Buffer.isBuffer(e.chunk)) frames.push(e.chunk.toString("utf8"));
+    }
+    return frames;
+}
+
+// A chunk may carry text and a functionCall part together. It is replayed whole
+// at settle (the call needs its signature, id and order), so the immediate text
+// frame must not also carry the chunk: the client would see the same content
+// twice. The guard has to look at the WHOLE chunk, because a call that follows
+// the text part in iteration order is still a call in this chunk.
+test("google parseStream: a chunk holding text and a call does not forward its text twice", async () => {
+    const adapter = createGoogleAdapter(REQUEST_BODY, "client system", "bili_absorb", "gemini-3-pro-preview");
+    const events = await collect(
+        adapter,
+        sse({ candidates: [{ content: { role: "model", parts: [{ text: "checking " }, { functionCall: { name: "read", args: { path: "src/plugin.ts" } } }] }, index: 0 }] }) +
+            sse({ candidates: [{ content: { role: "model", parts: [] }, finishReason: "STOP", index: 0 }], usageMetadata: { promptTokenCount: 10, candidatesTokenCount: 2 } }),
+    );
+    const frames = framesOf(events).join("");
+    assert.equal((frames.match(/checking /g) ?? []).length, 1, `the text reaches the client once, got: ${frames}`);
+    assert.equal((frames.match(/"name":"read"/g) ?? []).length, 1, `the call reaches the client once, got: ${frames}`);
+});
+
+// The edited copy an emptied tag leaves behind must not carry the chunk's
+// sibling call parts: settle drops a proxy call, so letting it ride along in the
+// immediate frame hands the client a proxy call that the proxy executes itself.
+test("google parseStream: an edited text frame carries no sibling proxy call", async () => {
+    const adapter = createGoogleAdapter(REQUEST_BODY, "client system", "bili_absorb", "gemini-3-pro-preview");
+    const TAG = "\x3cacp tokens=\"1\" type=\"text\"\x3e";
+    const CLOSE = "\x3c/acp\x3e";
+    const events = await collect(
+        adapter,
+        sse({ candidates: [{ content: { role: "model", parts: [{ text: `${TAG}${CLOSE}kept prose` }, { functionCall: { name: "bili_absorb", args: {} } }] }, index: 0 }] }) +
+            sse({ candidates: [{ content: { role: "model", parts: [] }, finishReason: "STOP", index: 0 }] }),
+    );
+    const frames = framesOf(events);
+    const leaked = frames.filter((f) => f.includes("kept prose") && f.includes("bili_absorb"));
+    assert.equal(leaked.length, 0, `no frame may carry the prose and the proxy call together, got: ${leaked.join(" | ")}`);
+    assert.equal(frames.filter((f) => f.includes("kept prose")).length, 1, `the surviving prose still arrives once, got: ${frames.join(" | ")}`);
+});
