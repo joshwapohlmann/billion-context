@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url";
 import fs from "node:fs";
 import path from "node:path";
 import { acquireInFlight, findSessionByCanonicalId, listSessions, markCompactionBoundary, markDirty, peekSession, releaseInFlight, withSessionLock, type Session } from "./session.js";
-import { ABSORB_TOOL, ABSORB_TOOL_NAME, ABSORB_TOOL_OPENAI, ABSORB_TOOL_RESPONSES, ACP_TOOLS_ANTHROPIC, ACP_TOOLS_OPENAI, ACP_TOOLS_RESPONSES, PROXY_TOOL_NAMES } from "./compress-tool.js";
+import { ABSORB_TOOL, ABSORB_TOOL_NAME, ABSORB_TOOL_OPENAI, ABSORB_TOOL_RESPONSES, ACP_TOOLS_ANTHROPIC, ACP_TOOLS_OPENAI, ACP_TOOLS_RESPONSES, PROXY_TOOL_NAMES, SEARCH_CONTEXT_CONVERSATION_ID_PARAM, SEARCH_CONTEXT_TOOL_NAME } from "./compress-tool.js";
 import { effectiveAbsorbConfig, isProxyToolFor } from "./absorb.js";
 import { executeProxyTool } from "./loop/core.js";
 import { normalizeSseLineEndings } from "./sse-util.js";
@@ -369,6 +369,27 @@ function withConversationIdParam(tool: unknown): unknown {
     return copy;
 }
 
+// #841: search_context's conversation_id doubles as a cross-session read-only
+// search target — widen that one entry's param description beyond the shared
+// routing text (same wording the wire-mode BILI_ constants serve).
+function withSearchContextConversationDescription(tools: unknown[]): unknown[] {
+    return tools.map((tool) => {
+        const t = tool as Record<string, unknown> | null | undefined;
+        if (!t || typeof t !== "object") return tool;
+        const fn = t.function as { name?: unknown } | undefined;
+        const name = typeof t.name === "string" ? t.name : (fn && typeof fn.name === "string" ? fn.name : undefined);
+        if (name !== SEARCH_CONTEXT_TOOL_NAME) return tool;
+        const copy = structuredClone(t) as Record<string, unknown>;
+        const cfn = copy.function as { parameters?: unknown } | undefined;
+        const schema = (copy.input_schema ?? cfn?.parameters ?? copy.parameters) as { properties?: Record<string, unknown> } | undefined;
+        const props = schema?.properties;
+        const param = props?.conversation_id;
+        if (!props || !param || typeof param !== "object") return tool;
+        props.conversation_id = { ...(param as Record<string, unknown>), ...SEARCH_CONTEXT_CONVERSATION_ID_PARAM };
+        return copy;
+    });
+}
+
 export function handlePluginManifest(res: import("node:http").ServerResponse): void {
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({
@@ -383,9 +404,9 @@ export function handlePluginManifest(res: import("node:http").ServerResponse): v
         // manifest has no request context to know which route will win.
         toolNames: [...PROXY_TOOL_NAMES, ABSORB_TOOL_NAME],
         tools: {
-            anthropic: [...ACP_TOOLS_ANTHROPIC, ABSORB_TOOL].map(withConversationIdParam),
-            openai: [...ACP_TOOLS_OPENAI, ABSORB_TOOL_OPENAI].map(withConversationIdParam),
-            responses: [...ACP_TOOLS_RESPONSES, ABSORB_TOOL_RESPONSES].map(withConversationIdParam),
+            anthropic: withSearchContextConversationDescription([...ACP_TOOLS_ANTHROPIC, ABSORB_TOOL].map(withConversationIdParam)),
+            openai: withSearchContextConversationDescription([...ACP_TOOLS_OPENAI, ABSORB_TOOL_OPENAI].map(withConversationIdParam)),
+            responses: withSearchContextConversationDescription([...ACP_TOOLS_RESPONSES, ABSORB_TOOL_RESPONSES].map(withConversationIdParam)),
         },
         headers: { agent: PLUGIN_AGENT_HEADER, conversation: PLUGIN_CONVERSATION_HEADER, contextWindow: PLUGIN_CONTEXT_WINDOW_HEADER },
         toolEndpoint: "/__bili/plugin/tool",

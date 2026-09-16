@@ -43,7 +43,7 @@ import {
 } from "acp-kernel/wire";
 import { responsesToCoreWithToolImages as responsesToCore, patchResponsesInputWithToolImages as patchResponsesInput } from "./responses-tool-output.js";
 import { getSession, listSessions, type Session, initSessions, markDirty, flushAllSessions, acquireInFlight, releaseInFlight, withSessionLock, markNativeCompactionBoundary, reconcileNativeCompactionBoundary, snapshotMessages, applyCompactionArchive, ensureCanonicalId } from "./session.js";
-import { ABSORB_TOOL, ABSORB_TOOL_OPENAI, ABSORB_TOOL_RESPONSES, COMPRESS_TOOL, ACP_TOOLS_ANTHROPIC, ACP_TOOLS_OPENAI, ACP_TOOLS_RESPONSES, ACP_READONLY_TOOLS_RESPONSES, COMPRESS_TOOL_NAME, buildAbsorbSystemPrompt, buildCompressSystemPrompt, buildCompressHybridSystemPrompt, withConversationIdNote, withMarkerIntegrityNote, withStagedCompressGuidance } from "./compress-tool.js";
+import { ABSORB_TOOL, ABSORB_TOOL_OPENAI, ABSORB_TOOL_RESPONSES, COMPRESS_TOOL, BILI_ACP_TOOLS_ANTHROPIC, BILI_ACP_TOOLS_OPENAI, BILI_ACP_TOOLS_RESPONSES, BILI_ACP_READONLY_TOOLS_RESPONSES, COMPRESS_TOOL_NAME, buildAbsorbSystemPrompt, buildCompressSystemPrompt, buildCompressHybridSystemPrompt, withConversationIdNote, withMarkerIntegrityNote, withStagedCompressGuidance } from "./compress-tool.js";
 import { applyAbsorbView, absorbEnabled, absorbToolName, storeEffectiveAbsorb } from "./absorb.js";
 import { rewriteJsonResponse, type RewriteCtx } from "./stream.js";
 import { applyRanges } from "./stream.js";
@@ -2214,8 +2214,8 @@ function prepareResponses(
             rebuiltInput = injectResponsesDeveloperMessage(rebuiltInput, devContent);
             if (!process.env.ACP_NO_INJECT_TOOL && injectTools) {
                 toolsOut = responsesTextProtocol
-                    ? injectResponsesTool(parsed.tools, ACP_READONLY_TOOLS_RESPONSES, surface?.toolPrompts)
-                    : injectResponsesTool(parsed.tools, absorbActive ? [...ACP_TOOLS_RESPONSES, ABSORB_TOOL_RESPONSES] : ACP_TOOLS_RESPONSES, surface?.toolPrompts);
+                    ? injectResponsesTool(parsed.tools, BILI_ACP_READONLY_TOOLS_RESPONSES, surface?.toolPrompts)
+                    : injectResponsesTool(parsed.tools, absorbActive ? [...BILI_ACP_TOOLS_RESPONSES, ABSORB_TOOL_RESPONSES] : BILI_ACP_TOOLS_RESPONSES, surface?.toolPrompts);
             }
         } else if (projection.systemParts.length > 0 || forgedSummaries.length > 0) {
             const devContent = [...projection.systemParts, ...forgedSummaries].join("\n\n---\n\n");
@@ -2552,7 +2552,7 @@ function injectSystem(
 }
 
 function injectTool(tools: unknown[] | undefined, extra?: { name: string }, toolPrompts?: ToolPrompts): unknown[] {
-    const acp = applyAcpToolOverrides(ACP_TOOLS_ANTHROPIC, toolPrompts);
+    const acp = applyAcpToolOverrides(BILI_ACP_TOOLS_ANTHROPIC, toolPrompts);
     if (!Array.isArray(tools)) return extra ? [...acp, extra] : [...acp];
     const names = new Set(tools.map((t) => (t as { name?: string })?.name));
     const missing = acp.filter((t) => !names.has(t.name));
@@ -2562,7 +2562,7 @@ function injectTool(tools: unknown[] | undefined, extra?: { name: string }, tool
 }
 
 function injectOpenaiTool(tools: OpenAITool[] | undefined, extra?: OpenAITool, toolPrompts?: ToolPrompts): OpenAITool[] {
-    const acp = applyAcpToolOverrides(ACP_TOOLS_OPENAI, toolPrompts) as OpenAITool[];
+    const acp = applyAcpToolOverrides(BILI_ACP_TOOLS_OPENAI, toolPrompts) as OpenAITool[];
     if (!Array.isArray(tools)) return extra ? [...acp, extra] : ([...acp] as OpenAITool[]);
     const present = new Set(
         tools
@@ -2584,7 +2584,7 @@ const FORCE_TEXT_PROTOCOL = process.env.ACP_COMPRESS_PROTOCOL === "text";
 /** Inject all ACP tools (compress/decompress/search_context/acp_status) in
  *  Responses API flat format, matching the PROXY_TOOL_NAMES set the compress
  *  loop dispatches on. Idempotent. */
-function injectResponsesTool(tools: unknown[] | undefined, toolsToAdd: readonly { name: string }[] = ACP_TOOLS_RESPONSES, toolPrompts?: ToolPrompts): unknown[] {
+function injectResponsesTool(tools: unknown[] | undefined, toolsToAdd: readonly { name: string }[] = BILI_ACP_TOOLS_RESPONSES, toolPrompts?: ToolPrompts): unknown[] {
     const base = applyAcpToolOverrides(toolsToAdd, toolPrompts);
     if (!Array.isArray(tools)) return [...base];
     const present = new Set(

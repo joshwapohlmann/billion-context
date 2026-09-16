@@ -469,6 +469,15 @@ export class SessionStore {
         return session;
     }
 
+    /** Read-only state load for cross-session search (#841): unlike loadSync,
+     *  never schedules a save (no #408 clamp-rewrite side effect). */
+    loadStateForSearch(id: string): CompressionState | null {
+        if (!this.enabled) return null;
+        const envelope = this.loadEnvelope(id);
+        if (!envelope) return null;
+        return mergeState(envelope.payload.state);
+    }
+
     /** #405 fix #4: dual-instance rollback guard. When two proxy processes
      *  share BILI_SESSIONS_DIR, whoever saves last used to win — an instance
      *  holding a STALE in-memory copy would roll counters back (requests:3 →

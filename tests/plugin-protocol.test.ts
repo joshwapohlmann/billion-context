@@ -215,7 +215,7 @@ test("plugin manifest serves the exact wire tool schemas, headers and version", 
             protocolVersion: number;
             version: string;
             toolNames: string[];
-            tools: Record<string, Array<{ name: string }>>;
+            tools: Record<string, Array<Record<string, unknown>>>;
             headers: { agent: string; conversation: string };
             toolEndpoint: string;
         };
@@ -223,10 +223,24 @@ test("plugin manifest serves the exact wire tool schemas, headers and version", 
         assert.equal(manifest.protocolVersion, 1);
         assert.ok(/^\d+\.\d+\.\d+/.test(manifest.version), `version looks wrong: ${manifest.version}`);
         assert.deepEqual([...manifest.toolNames].sort(), ["absorb", "acp_status", "compress", "decompress", "search_context"]);
-        const names = manifest.tools.anthropic!.map((t) => t.name).sort();
+        const names = manifest.tools.anthropic!.map((t) => String(t.name)).sort();
         assert.deepEqual(names, ["absorb", "acp_status", "compress", "decompress", "search_context"]);
         assert.equal(manifest.tools.openai!.length, 5);
         assert.equal(manifest.tools.responses!.length, 5);
+        // #841: search_context's conversation_id doubles as a cross-session
+        // read-only search target — its param description must carry the
+        // historical-search wording in every wire shape.
+        const searchEntry = (shape: string): Record<string, unknown> | undefined =>
+            manifest.tools[shape]!.find((t) => {
+                const fn = t.function as { name?: unknown } | undefined;
+                return t.name === "search_context" || (fn !== null && typeof fn === "object" && fn.name === "search_context");
+            });
+        const anthropicProps = ((searchEntry("anthropic")?.input_schema ?? {}) as { properties?: Record<string, unknown> }).properties;
+        assert.match(String(anthropicProps?.conversation_id?.description), /historical pfa-\*/);
+        const openaiProps = (((searchEntry("openai")?.function ?? {}) as { parameters?: { properties?: Record<string, unknown> } }).parameters?.properties);
+        assert.match(String(openaiProps?.conversation_id?.description), /historical pfa-\*/);
+        const responsesProps = ((searchEntry("responses")?.parameters ?? {}) as { properties?: Record<string, unknown> }).properties;
+        assert.match(String(responsesProps?.conversation_id?.description), /historical pfa-\*/);
         assert.equal(manifest.headers.agent, "x-bili-plugin");
         assert.equal(manifest.headers.conversation, "x-bili-plugin-conversation");
         assert.equal(manifest.toolEndpoint, "/__bili/plugin/tool");

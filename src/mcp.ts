@@ -245,16 +245,26 @@ async function handleMessage(msg: {
             // proxy printed in its notes ("your bili conversation id: …").
             // Overrides the default binding (env/meta); stripped before
             // forwarding since the proxy routes on the body-level field.
+            // #841 exception: search_context's conversation_id doubles as a
+            // cross-session READ-ONLY search target. When a default binding
+            // exists, keep the param in args (the proxy resolves the target
+            // session itself, incl. non-resident ones from disk) and never
+            // re-route the call away from the caller's binding — routing to
+            // another session would mutate that session's mode/lastSeen. With
+            // no default binding, perCall stays the routing fallback and is
+            // stripped, exactly as before.
             const perCallRaw = rawArgs.conversation_id;
             const perCall = typeof perCallRaw === "string" ? perCallRaw.trim() : "";
+            const keepForSearch = tool === "search_context" && perCall.length > 0 && typeof conversationId === "string" && conversationId.length > 0;
             const args = { ...rawArgs };
-            delete args.conversation_id;
-            if (!perCall && !conversationId) {
+            if (!keepForSearch) delete args.conversation_id;
+            const routeOverride = keepForSearch ? undefined : perCall || undefined;
+            if (!routeOverride && !conversationId) {
                 sendError(id, ERR_TOOL, "no conversation id (pass the conversation_id argument — see the 'your bili conversation id' line in the proxy notes — or set BILI_CONVERSATION_ID or connect via Claude Code MCP session meta)");
                 return;
             }
             try {
-                const text = await forwardTool(tool, args, TOOL_TIMEOUT_MS, perCall || undefined);
+                const text = await forwardTool(tool, args, TOOL_TIMEOUT_MS, routeOverride);
                 sendResult(id, { content: [{ type: "text", text }], isError: false });
             } catch (err) {
                 // Protocol failures are results (isError), not JSON-RPC

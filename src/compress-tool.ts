@@ -10,7 +10,18 @@
  *    (The #603 single-quote salvage lives in the kernel ladder since 0.0.59;
  *    this wrapper only surfaces its diagnostics.)
  */
-import { parseCompressArgs, ABSORB_TOOL_OPENAI } from "acp-kernel";
+import {
+    parseCompressArgs,
+    ABSORB_TOOL_OPENAI,
+    SEARCH_CONTEXT_TOOL,
+    SEARCH_CONTEXT_TOOL_OPENAI,
+    SEARCH_CONTEXT_TOOL_RESPONSES,
+    SEARCH_CONTEXT_TOOL_NAME,
+    ACP_TOOLS_ANTHROPIC,
+    ACP_TOOLS_OPENAI,
+    ACP_TOOLS_RESPONSES,
+    ACP_READONLY_TOOLS_RESPONSES,
+} from "acp-kernel";
 import { log as loggerLog } from "./logger.js";
 import { maxShrinkPerCompress } from "./fetch-util.js";
 
@@ -53,6 +64,48 @@ export {
 } from "acp-kernel";
 export type { ParsedRange, AbsorbConfig } from "acp-kernel";
 export { ACP_TOOL_NAMES as PROXY_TOOL_NAMES, ACP_MUTATING_TOOLS as MUTATING_PROXY_TOOLS, ACP_READONLY_TOOLS as READONLY_PROXY_TOOLS } from "acp-kernel";
+
+// #841: host-side conversation_id extension of search_context. Kernel constants
+// are shared and never mutated; ALL wire-mode injection points must use these
+// BILI_ arrays or the served schema drifts between wire mode and plugin mode
+// (the plugin manifest reuses SEARCH_CONTEXT_CONVERSATION_ID_PARAM below).
+export const SEARCH_CONTEXT_CONVERSATION_ID_PARAM = {
+    type: "string",
+    description: "Target bili conversation id. Defaults to the current conversation. May reference another historical pfa-* session for read-only search.",
+};
+
+type JsonSchemaObject = { type: string; properties?: Record<string, unknown>; required?: string[] };
+
+function withConversationId(schema: JsonSchemaObject): JsonSchemaObject {
+    return { ...schema, properties: { ...schema.properties, conversation_id: SEARCH_CONTEXT_CONVERSATION_ID_PARAM } };
+}
+
+export const BILI_SEARCH_CONTEXT_TOOL = {
+    name: SEARCH_CONTEXT_TOOL.name,
+    description: SEARCH_CONTEXT_TOOL.description,
+    input_schema: withConversationId(SEARCH_CONTEXT_TOOL.input_schema),
+};
+
+export const BILI_SEARCH_CONTEXT_TOOL_OPENAI = {
+    type: "function" as const,
+    function: {
+        name: SEARCH_CONTEXT_TOOL_OPENAI.function.name,
+        description: SEARCH_CONTEXT_TOOL_OPENAI.function.description,
+        parameters: withConversationId(SEARCH_CONTEXT_TOOL_OPENAI.function.parameters),
+    },
+};
+
+export const BILI_SEARCH_CONTEXT_TOOL_RESPONSES = {
+    type: "function" as const,
+    name: SEARCH_CONTEXT_TOOL_RESPONSES.name,
+    description: SEARCH_CONTEXT_TOOL_RESPONSES.description,
+    parameters: withConversationId(SEARCH_CONTEXT_TOOL_RESPONSES.parameters),
+};
+
+export const BILI_ACP_TOOLS_ANTHROPIC = ACP_TOOLS_ANTHROPIC.map((t) => (t.name === SEARCH_CONTEXT_TOOL_NAME ? BILI_SEARCH_CONTEXT_TOOL : t));
+export const BILI_ACP_TOOLS_OPENAI = ACP_TOOLS_OPENAI.map((t) => (t.function.name === SEARCH_CONTEXT_TOOL_NAME ? BILI_SEARCH_CONTEXT_TOOL_OPENAI : t));
+export const BILI_ACP_TOOLS_RESPONSES = ACP_TOOLS_RESPONSES.map((t) => (t.name === SEARCH_CONTEXT_TOOL_NAME ? BILI_SEARCH_CONTEXT_TOOL_RESPONSES : t));
+export const BILI_ACP_READONLY_TOOLS_RESPONSES = ACP_READONLY_TOOLS_RESPONSES.map((t) => (t.name === SEARCH_CONTEXT_TOOL_NAME ? BILI_SEARCH_CONTEXT_TOOL_RESPONSES : t));
 
 // The kernel ships no Responses-format absorb const (the four ACP tools have
 // *_RESPONSES variants; absorb is host-registered opt-in). Synthesize it in
