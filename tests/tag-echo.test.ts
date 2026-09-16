@@ -608,3 +608,64 @@ test("anthropic adapter warns on degenerate typo-tag-only turn (#673)", async ()
         setLogCapture(null);
     }
 });
+
+// The wrapped-turn imitation, recorded in the architect session
+// 01a0a0cb-4a90-74db-8e19-814e80cd4e20 at 2026-09-16T17:29:09: the model opens a
+// render tag and writes the whole turn — its tool call included — where the
+// attributes are still open, so no close is ever written and no tag regex can
+// match the span. The client received the orphan markup, found no tool call in
+// it and stalled until it was nudged by hand. Source: the session store at
+// <omp-agent>/sessions/-Nextcloud-ai-joshwa-architect/…_01a0a0cb-….jsonl.
+const DSML_PIPE = "\uFF5C\uFF5CDSML\uFF5C\uFF5C";
+const dsmlClose = (name: string) => `${LT}/${DSML_PIPE} ${name}>`;
+
+/** @param bracket what the recorded turn wrote where the opening's value was
+ *  still open — nothing (the recorded bytes) or a stray `>`. Both reach the
+ *  client today; both must end as an empty turn. */
+function wrappedTurnEcho(bracket = ""): string {
+    return [
+        `${OPEN}tokens="1" text="text${bracket}${dsmlClose("parameter")}`,
+        `${LT}parameter name="i">Rebuilding to test the source, not the build${dsmlClose("parameter")}`,
+        `${LT}/invoke>`,
+        `${dsmlClose("calls")}"`,
+        dsmlClose("parameter"),
+        `${LT}/invoke>`,
+        dsmlClose("calls"),
+    ].join("\n");
+}
+
+test("stripAcpTags swallows a wrapped-turn imitation whole, leaving no orphan markup", () => {
+    for (const echo of [wrappedTurnEcho(), wrappedTurnEcho(">")]) {
+        assert.ok(containsToolCallXmlFragment(echo), "the fixture holds the turn's tool-call markup");
+        assert.equal(stripAcpTags(echo), "", "the whole wrapped span goes, not just the opening");
+    }
+});
+
+test("stripAcpTags ends a wrapped span at a loose close, keeping prose after it", () => {
+    const echo = wrappedTurnEcho();
+    const prose = "然后是真正的回答：构建通过。";
+    const out = stripAcpTags(`bad ${echo}${CLOSE} ${prose} tail`);
+    assert.equal(out, `bad  ${prose} tail`, "prose after the imitation's close survives");
+});
+
+test("streaming filter matches stripAcpTags for a wrapped-turn imitation at every split position", () => {
+    for (const echo of [`${wrappedTurnEcho()}`, `${wrappedTurnEcho(">")}`, `${OPEN}tokens="1" text="unfinished${LT}invoke name="read">${LT}/invoke>`, TAG("m00155")]) {
+        const full = `lead ${echo} tail`;
+        const expected = stripAcpTags(full);
+        for (let split = 0; split <= full.length; split++) {
+            const f = createTagEchoFilter();
+            const out = f.push(full.slice(0, split)) + f.push(full.slice(split)) + f.flush();
+            assert.equal(out, expected, `split=${split} full=${JSON.stringify(full)}`);
+        }
+    }
+});
+
+test("streaming filter swallows a wrapped-turn imitation push by push, never emitting its payload", () => {
+    const echo = wrappedTurnEcho();
+    const f = createTagEchoFilter();
+    let visible = "";
+    for (let i = 0; i < echo.length; i += 7) visible += f.push(echo.slice(i, i + 7));
+    visible += f.flush();
+    assert.equal(visible, "", "nothing of the wrapped turn reaches the client");
+    assert.ok(f.stats().dropped, "the span is accounted as dropped");
+});

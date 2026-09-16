@@ -3,6 +3,13 @@
 // imitate them in visible output ("tag echo"), the client replays the echoed
 // tags on later turns, and the imitation amplifies into unbounded repetition.
 // Stripping render tags from outgoing text breaks the loop at the source.
+//
+// The imitation has two shapes. The plain one is a copy of the rendered form
+// (an opening with its attributes, a ref inside, a close); the wrapped one puts
+// the model's whole turn, its tool call included, where the opening's
+// attributes are still open, so no close is ever written and regex matching
+// alone cannot see the span (see BROKEN_ATTRS, SWALLOW_CAP). Both end the same
+// way: the span is swallowed, never handed to the client as orphan markup.
 // ONLY the render form (\x3c<name> attrs…\x3e, \x3c<name …/\x3e, \x3c/<name>\x3e) is stripped —
 // the underscore-namespaced text-protocol triggers (\x3cacp_compress\x3e etc.) and
 // ordinary prose containing \x3c pass through untouched.
@@ -46,6 +53,16 @@ const TRUNC_OPEN = new RegExp("\x3c" + NAME + "\\s[^<>]*$");
 // plus truncated attrs — a truncated imitation close, never prose. Mirrors
 // TRUNC_OPEN on the close side.
 const TRUNC_CLOSE = new RegExp("\x3c\\/" + NAME + "(?:\\s[^<>]{0,32})?$");
+// The wrapped-turn imitation: the model opens a render tag and writes its
+// payload where the attributes are still open, so the attribute list runs into
+// a `<` instead of ending at its `>`. The recorded shape (architect session
+// 01a0a0cb, 2026-09-16T17:29:09) opens with `<acp tokens="1" text="text`
+// immediately followed by the turn's own tool-call markup. No tag regex can
+// match it — every attribute class stops at `<` — so the span is recognised by
+// shape: a render-tag name, whitespace, then an attribute list bounded by the
+// next `<`. A properly terminated opening never matches: its attribute list
+// ends at a `>`, and no `<` can be reached from there within the class.
+const BROKEN_ATTRS = new RegExp("\x3c" + NAME + "\\s[^<>]{0,512}(?=\x3c)");
 const DEFINITE_TAIL = new RegExp("^\x3c" + NAME + "\\s|^\x3c\\/" + NAME);
 const OPEN_WITH_ATTRS = new RegExp("^\x3c" + NAME + "\\s");
 const CLOSE_HEAD = "\x3c/";
@@ -55,6 +72,13 @@ const HOLD_LIMIT = 128;
 // opening; beyond this the tail is dropped instead of held or passed through.
 const TAG_OPEN_CAP = 4096;
 const SWALLOW_CAP = 80;
+// Budget for a wrapped-turn imitation (see BROKEN_ATTRS), which is attested by
+// shape rather than matched: the span is the imitation's payload, so passing
+// the budget discards it instead of releasing it as prose (SWALLOW_CAP's #644
+// rule, kept for the plain opening where an over-long tail is real content).
+// It has to clear a whole turn — the recorded one ran 186 chars and held the
+// turn's tool call.
+const IMITATION_SWALLOW_CAP = 4096;
 
 /** Exclusive end index (past the terminating \x3e) of the first loose close
  *  tag in s, or -1. #673: the close name may be a typo variant; termination
@@ -68,6 +92,28 @@ function looseCloseEnd(s: string): number {
         idx = s.indexOf(CLOSE_HEAD, idx + 1);
     }
     return -1;
+}
+
+/** The span of one wrapped-turn imitation in `s`: where it starts, and the span
+ *  that has to go — its head plus, when no loose close follows, the rest of the
+ *  text (the model's whole turn lives inside it, tool call included). Returns
+ *  null when no opening in `s` wraps the turn. An opening wraps the turn when
+ *  its attribute list carries an odd number of quotes — a value was opened and
+ *  never closed — or when the list runs into a `<` at all (BROKEN_ATTRS). Every
+ *  genuine opening is balanced, e.g. `tokens="1" type="text"`. */
+function wrappedSpan(s: string): { start: number; end: number } | null {
+    const broken = BROKEN_ATTRS.exec(s);
+    const open = LONE_OPEN.exec(s);
+    const spans: { start: number; end: number }[] = [];
+    if (broken) spans.push({ start: broken.index, end: broken.index + broken[0].length });
+    if (open && OPEN_WITH_ATTRS.test(open[0]) && ((open[0].match(/"/g) ?? []).length & 1) === 1) {
+        spans.push({ start: open.index, end: open.index + open[0].length });
+    }
+    if (spans.length === 0) return null;
+    const first = spans.reduce((a, b) => (b.start < a.start ? b : a));
+    const rest = s.slice(first.end);
+    const close = looseCloseEnd(rest);
+    return { start: first.start, end: close >= 0 ? first.end + close : s.length };
 }
 
 export interface TagEchoFilterStats {
@@ -135,7 +181,16 @@ export function stripMarkerLines(text: string): string {
 }
 
 export function stripAcpTags(text: string): string {
-    return text
+    // A wrapped-turn imitation first, whole: it swallows the model's turn, and
+    // leaving its payload behind hands the client the orphan markup that makes
+    // the turn unusable. Each pass removes at least the head, so this ends.
+    let out = text;
+    for (;;) {
+        const wrapped = wrappedSpan(out);
+        if (wrapped === null) break;
+        out = out.slice(0, wrapped.start) + out.slice(wrapped.end);
+    }
+    return out
         .replace(new RegExp(PAIRED.source, "g"), "")
         .replace(new RegExp(LONE_OPEN.source, "g"), "")
         .replace(new RegExp(LONE_CLOSE.source, "g"), "")
@@ -187,6 +242,14 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void): TagEcho
     let held = "";
     let swallowUntilClose = false;
     let swallowed = "";
+    /** Which budget the current swallow answers to (SWALLOW_CAP or
+     *  IMITATION_SWALLOW_CAP). */
+    let swallowLimit = SWALLOW_CAP;
+    /** Whether passing that budget releases the span as prose — true for a plain
+     *  opening, where an over-long tail is content (#644); false for a
+     *  wrapped-turn imitation, which is attested by shape and whose payload must
+     *  never reach the client. */
+    let swallowReleases = true;
     let droppedAny = false;
     let notified = false;
     let inputChars = 0;
@@ -212,11 +275,17 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void): TagEcho
                     buf = combined.slice(end);
                     continue;
                 }
-                if (combined.length > SWALLOW_CAP) {
+                if (combined.length > swallowLimit) {
                     swallowed = "";
-                    swallowUntilClose = false;
-                    buf = combined;
-                    continue;
+                    if (swallowReleases) {
+                        swallowUntilClose = false;
+                        buf = combined;
+                        continue;
+                    }
+                    // The span is an attested imitation's payload: discard it and
+                    // keep swallowing, so no part of it reaches the client.
+                    drop(combined);
+                    return out;
                 }
                 swallowed = combined;
                 return out;
@@ -229,6 +298,25 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void): TagEcho
                 if (cand && (m === null || cand.index < m.index)) m = cand;
             }
             if (!m) {
+                // An opening whose attribute list never terminates (see
+                // BROKEN_ATTRS): everything after it is the imitation's payload,
+                // the turn's own tool call among it. Dropping the head alone
+                // would hand the client the orphan markup that makes the turn
+                // unusable, so the span is swallowed whole and the turn reaches
+                // the client empty, where the degenerate-turn retry re-asks for
+                // it (#732/#821). A loose close still ends the span, so genuine
+                // prose after a closed imitation survives.
+                const broken = BROKEN_ATTRS.exec(buf);
+                if (broken) {
+                    drop(broken[0]);
+                    out += buf.slice(0, broken.index);
+                    buf = buf.slice(broken.index + broken[0].length);
+                    swallowUntilClose = true;
+                    swallowLimit = IMITATION_SWALLOW_CAP;
+                    swallowReleases = false;
+                    swallowed = "";
+                    continue;
+                }
                 const t = PARTIAL_TAIL.exec(buf);
                 if (t) {
                     // A definite \x3c<name> opening is never prose — hold it far
@@ -258,7 +346,17 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void): TagEcho
             // span — only an attrs-bearing LONE_OPEN leaves the stream
             // mid-tag and needs to swallow until its close arrives.
             if (m === o && OPEN_WITH_ATTRS.test(m[0])) {
+                // An odd number of quotes means the opening's attribute list
+                // never closed: the model wrapped its turn inside the value (the
+                // sibling shape opens with such a value and then runs into a `<`,
+                // which BROKEN_ATTRS catches). A wrapped span is the imitation's
+                // payload — its tool call among it — so it is discarded rather
+                // than released at the #644 budget. Every genuine opening has
+                // balanced quotes: `tokens="1" type="text"`.
+                const wrapped = ((m[0].match(/"/g) ?? []).length & 1) === 1;
                 swallowUntilClose = true;
+                swallowLimit = wrapped ? IMITATION_SWALLOW_CAP : SWALLOW_CAP;
+                swallowReleases = !wrapped;
                 swallowed = "";
             }
         }
