@@ -74,6 +74,7 @@ import { containsToolCallXmlFragment } from "./loop/tag-echo-filter.js";
 import { isStrictReasoningEcho, normalizeStrictEchoReasoning } from "./strict-echo.js";
 export { isStrictReasoningEcho, normalizeStrictEchoReasoning };
 import { isFakeCompletion, injectFakeCompletionHint, maxFakeCompletionRetries, fakeBufCap } from "./fake-completion.js";
+import { makeContinuationRefetch } from "./degenerate-retry.js";
 import { reasoningGuardEngages, runReasoningGuard } from "./reasoning-guard.js";
 import { sanitizeResponsesInputIds, dropWhitespaceResponsesMessages, normalizeResponsesMessageItems } from "./loop/adapter-responses.js";
 import { CODEX_COMPACT_HEALTH_RATIO, codexCompactMode, isCodexClient, hasCompactionTrigger, stripBiliCompactionItems, replaceBiliCompactionItems, codexCompactGate, codexCompactGatePre, buildTriggerForgeBody, mergeForgedSummaries } from "./codex-compact.js";
@@ -3865,7 +3866,28 @@ async function forward(
                 if (prepared.protocol === "responses") {
                     await pipePluginResponsesWithStrip(pluginBody, res, prepared.session, (msg) => log("info", `[${prepared.session.id}] ${msg}`));
                 } else {
-                    await pipePluginChatWithStrip(pluginBody, res, prepared.protocol, prepared.session, (msg) => log("info", `[${prepared.session.id}] ${msg}`));
+                    // #732/#821: the plugin pipe re-issues the agent's own body
+                    // once when a turn ends with nothing visible (the render-tag
+                    // echo case) — it holds the URL and headers, this is where
+                    // they live.
+                    await pipePluginChatWithStrip(
+                        pluginBody,
+                        res,
+                        prepared.protocol,
+                        prepared.session,
+                        (msg) => log("info", `[${prepared.session.id}] ${msg}`),
+                        makeContinuationRefetch({
+                            protocol: prepared.protocol,
+                            body,
+                            upstreamUrl,
+                            reqHeaders: buildForwardHeaders(headers),
+                            proxyUrl,
+                            dispatcher,
+                            signal: clientAbort.signal,
+                            log,
+                            label: prepared.session.id,
+                        }),
+                    );
                 }
             } else {
                 await pipePluginJson(pluginBody, res, prepared.session, prepared.protocol);
@@ -3972,7 +3994,24 @@ async function forward(
             if (p.protocol === "responses") {
                 await pipePluginResponsesWithStrip(responseBody, res, undefined, tagLog);
             } else {
-                await pipePluginChatWithStrip(responseBody, res, p.protocol, undefined, tagLog);
+                await pipePluginChatWithStrip(
+                    responseBody,
+                    res,
+                    p.protocol,
+                    undefined,
+                    tagLog,
+                    makeContinuationRefetch({
+                        protocol: p.protocol,
+                        body,
+                        upstreamUrl,
+                        reqHeaders: buildForwardHeaders(headers),
+                        proxyUrl,
+                        dispatcher,
+                        signal: clientAbort.signal,
+                        log,
+                        label: p.session.id,
+                    }),
+                );
             }
         } else if (
             prepared &&
