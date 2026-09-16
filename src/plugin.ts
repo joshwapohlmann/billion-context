@@ -870,6 +870,13 @@ export async function pipePluginChatWithStrip(
         // saw (an emptying tag echo): the retry's content is filtered from
         // scratch, so a partial tag there cannot swallow its opening characters.
         streams.clear();
+        // The first attempt is terminal and its body is drained; close the
+        // reader we are abandoning rather than leaving the socket held.
+        try {
+            await reader.cancel();
+        } catch {
+            /* already closed */
+        }
         reader = next.getReader();
         decoder = new TextDecoder("utf-8");
         buf = "";
@@ -1391,6 +1398,13 @@ export async function pipePluginResponsesWithStrip(
         // saw (an emptying tag echo): the retry's content is filtered from
         // scratch, so a partial tag there cannot swallow its opening characters.
         tagFilter.flush();
+        // The first attempt is terminal and its body is drained; close the
+        // reader we are abandoning rather than leaving the socket held.
+        try {
+            await reader.cancel();
+        } catch {
+            /* already closed */
+        }
         reader = next.getReader();
         decoder = new TextDecoder("utf-8");
         buf = "";

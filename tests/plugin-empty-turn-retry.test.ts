@@ -379,3 +379,53 @@ test("plugin responses does not retry a turn the provider failed or cut", async 
     );
     assert.equal(calls, 0, "a failed turn is a real terminal, not an empty one");
 });
+
+// #721: takeover resets sawTerminal, so a retry that is itself cut must still
+// warn the client instead of closing bare.
+const TRUNC_MARKER = "upstream_stream_truncated";
+
+/** A single chunk carrying content AND the finish reason — the coalescing some
+ *  upstreams do, which the gate must count before it can call a turn empty. */
+function coalescedChunk(content: string, reason: string): string {
+    return `data: ${JSON.stringify({ id: "chatcmpl-1", object: "chat.completion.chunk", created: 1, model: "qwen", choices: [{ index: 0, delta: { content }, finish_reason: reason }] })}\n\n`;
+}
+
+test("plugin chat: a coalesced content+finish_reason chunk counts its own text", async () => {
+    const out: string[] = [];
+    let calls = 0;
+    const refetch = () => {
+        calls += 1;
+        return Promise.resolve(streamOf(proseTurn("unwanted")));
+    };
+    await pipePluginChatWithStrip(streamOf([coalescedChunk("the whole answer", "stop"), DONE]), makeRes(out), "openai", makeSession(), undefined, refetch);
+    assert.equal(calls, 0, "content delivered in the same chunk as the finish reason is not an empty turn");
+    assert.equal(textDeltas(out.join(""), "openai"), "the whole answer");
+});
+
+test("plugin chat: a coalesced echo+finish_reason chunk still retries once", async () => {
+    const out: string[] = [];
+    let calls = 0;
+    const refetch = () => {
+        calls += 1;
+        return Promise.resolve(streamOf(proseTurn("recovered after the coalesced echo")));
+    };
+    await pipePluginChatWithStrip(streamOf([coalescedChunk(`${TAG_OPEN}m00155${TAG_CLOSE}`, "stop"), DONE]), makeRes(out), "openai", makeSession(), undefined, refetch);
+    const text = out.join("");
+    assert.equal(calls, 1, "the gate runs after the chunk is processed, so the emptied echo is still seen");
+    assert.equal(textDeltas(text, "openai"), "recovered after the coalesced echo");
+    assert.ok(!text.includes("m00155"), "the echoed tag never leaks");
+});
+
+test("plugin chat: a retry stream that is cut still raises the truncation signal", async () => {
+    const out: string[] = [];
+    let calls = 0;
+    const refetch = () => {
+        calls += 1;
+        return Promise.resolve(streamOf([]));
+    };
+    await pipePluginChatWithStrip(streamOf(echoOnlyTurn()), makeRes(out), "openai", makeSession(), undefined, refetch);
+    const text = out.join("");
+    assert.equal(calls, 1, "the retry was attempted");
+    assert.ok(text.includes(TRUNC_MARKER), `a cut retry must still warn the client, got: ${text}`);
+    assert.ok(text.includes("data: [DONE]"), "the stream is still terminated for the client");
+});
