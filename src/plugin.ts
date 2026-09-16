@@ -796,6 +796,7 @@ export async function pipePluginChatWithStrip(
     let buf = "";
     const acc: UsageSample = {};
     const onTagDrop = (snippet: string) => {
+        droppedTagInFrame = true;
         loggerLog("warn", `[tag-echo] stripped model-emitted render tag (plugin passthrough): ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
         log?.(`[tag-echo] stripped model-emitted render tag from plugin passthrough text`);
     };
@@ -831,6 +832,13 @@ export async function pipePluginChatWithStrip(
     let sawToolUse = false;
     let sawThinking = false;
     let visibleTextChars = 0;
+    /** Of that text, the chars released from a held markup span (the
+     *  unclosed-tag case): markup the filter declined to swallow. A turn whose
+     *  only visible output is this is as dead to the host as an empty one. */
+    let releasedMarkupChars = 0;
+    /** Set while a frame is being rewritten because a render tag was dropped:
+     *  the text that survives such a frame is the tag's own interior. */
+    let droppedTagInFrame = false;
     let finalFinishReason: string | undefined;
     // Degenerate-turn retry (#732/#821 for this pipe). The first attempt's
     // terminal event is dropped when the retry takes over, so the client sees
@@ -847,11 +855,13 @@ export async function pipePluginChatWithStrip(
      *  attempt it came from. */
     const retryEmptyTurn = async (reason: string | undefined): Promise<boolean> => {
         if (degenerateRetried || refetch === undefined) return false;
-        if (visibleTextChars > 0 || sawToolUse) return false;
+        // Markup released from a held span carries nothing the host can act on:
+        // an unclosed render tag stalls the turn exactly like an empty one.
+        if (visibleTextChars > releasedMarkupChars || sawToolUse) return false;
         if (reason === undefined || !CLEAN_TURN_REASONS.has(reason)) return false;
         if (res.destroyed || res.writableEnded) return false;
         degenerateRetried = true;
-        log?.("[plugin] degenerate terminal turn (no visible output); retrying once with a continuation nudge (#732/#821)");
+        log?.("[plugin] degenerate terminal turn (no usable output); retrying once with a continuation nudge (#732/#821)");
         let next: ReadableStream<Uint8Array> | null = null;
         try {
             next = await refetch();
@@ -919,7 +929,10 @@ export async function pipePluginChatWithStrip(
             const tail = s.filter.flush();
             if (tail.length > 0) {
                 out += syntheticTail(s.field, s.index, tail);
-                if (s.field === "content" || s.field === "text") visibleTextChars += tail.length;
+                if (s.field === "content" || s.field === "text") {
+                    visibleTextChars += tail.length;
+                    releasedMarkupChars += tail.length;
+                }
             }
         }
         return out;
@@ -1011,7 +1024,15 @@ export async function pipePluginChatWithStrip(
                 if (clean.length === 0) droppedText = true;
                 else {
                     keptText = true;
-                    if (field === "content") visibleTextChars += clean.length;
+                    if (field === "content") {
+                        visibleTextChars += clean.length;
+                        // What a dropped tag leaves behind is its own interior: the
+                        // host finds no tool call in it and stalls the turn.
+                        if (droppedTagInFrame) {
+                            releasedMarkupChars += clean.length;
+                            droppedTagInFrame = false;
+                        }
+                    }
                 }
                 if (changed) {
                     if (!rebuilt) {
@@ -1062,7 +1083,13 @@ export async function pipePluginChatWithStrip(
             if (field === "text" && raw.length > 0) visibleTextChars += raw.length;
             return rawEvent + "\n\n";
         }
-        if (field === "text" && clean.length > 0) visibleTextChars += clean.length;
+        if (field === "text" && clean.length > 0) {
+            visibleTextChars += clean.length;
+            if (droppedTagInFrame) {
+                releasedMarkupChars += clean.length;
+                droppedTagInFrame = false;
+            }
+        }
         if (clean.length === 0 && Object.keys(d ?? {}).length <= 2) return "";
         return rebuildEvent(rawEvent, { ...ev, delta: { ...d, [field]: clean } });
     };
