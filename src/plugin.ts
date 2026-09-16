@@ -1,6 +1,7 @@
 import { type CompressionCore, type Config, type CoreMessage, type NudgeDecision, defaultCountTokens } from "acp-kernel";
 import { buildStatusPanel } from "acp-kernel/panel";
 import { fileURLToPath } from "node:url";
+import type { ServerResponse } from "node:http";
 import fs from "node:fs";
 import path from "node:path";
 import { acquireInFlight, effectiveConfig, findSessionByCanonicalId, listSessions, markCompactionBoundary, markDirty, peekSession, releaseInFlight, withSessionLock, type Session } from "./session.js";
@@ -753,6 +754,14 @@ function mergeUsageSample(acc: UsageSample, sample: UsageSample): void {
     if (sample.outputTokens !== undefined) acc.outputTokens = sample.outputTokens;
 }
 
+/** Terminal reasons after which the model genuinely finished its turn. A
+ *  refusal or a safety block must never be re-prompted, and a token-capped turn
+ *  would only truncate again — so the degenerate-turn retry (#732/#821 for the
+ *  plugin pipe) engages on these alone. */
+const CLEAN_TURN_REASONS = new Set(["stop", "end_turn", "stop_sequence"]);
+
+const ANTHROPIC_BLOCK_EVENT = /^content_block_(start|delta|stop)$/;
+
 /** Plugin-mode streaming passthrough for the OpenAI chat-completions and
  *  Anthropic wires: forward upstream events byte-identical (the agent's
  *  native tool loop must see the model's tool calls untouched) while (a)
@@ -766,16 +775,24 @@ function mergeUsageSample(acc: UsageSample, sample: UsageSample): void {
  *  title-gen exclusion / ACP_NO_INJECT_TOOL / classifier bypass). Pass no
  *  session there — usage accounting must be skipped or a title-gen call's
  *  tiny input_tokens would clobber lastInputTokens and break compression
- *  triggering for the main conversation. */
+ *  triggering for the main conversation.
+ *
+ *  `refetch` supplies the one-shot degenerate-turn retry (#732/#821): when the
+ *  turn reaches its terminal with nothing visible — the tag-echo case, where
+ *  the filter empties the only text block so the host aborts an empty turn —
+ *  the pipe re-issues the request through it and splices the retry's content
+ *  into the client stream the first attempt already opened. Omit it for the
+ *  plain pass-through. */
 export async function pipePluginChatWithStrip(
     stream: ReadableStream<Uint8Array>,
-    res: import("node:http").ServerResponse,
+    res: ServerResponse,
     protocol: WireProtocol,
     session?: Session,
     log?: (msg: string) => void,
+    refetch?: () => Promise<ReadableStream<Uint8Array> | null>,
 ): Promise<void> {
-    const reader = stream.getReader();
-    const decoder = new TextDecoder("utf-8");
+    let reader = stream.getReader();
+    let decoder = new TextDecoder("utf-8");
     let buf = "";
     const acc: UsageSample = {};
     const onTagDrop = (snippet: string) => {
@@ -815,6 +832,80 @@ export async function pipePluginChatWithStrip(
     let sawThinking = false;
     let visibleTextChars = 0;
     let finalFinishReason: string | undefined;
+    // Degenerate-turn retry (#732/#821 for this pipe). The first attempt's
+    // terminal event is dropped when the retry takes over, so the client sees
+    // one turn: its framing stays open, and the retry's content blocks are
+    // shifted past the ones already streamed.
+    let degenerateRetried = false;
+    let inRetry = false;
+    let retryIndexOffset = 0;
+    let blocksForwarded = 0;
+    /** One-shot re-issue when a turn reaches its terminal with nothing visible:
+     *  the tag-echo case, where the filter empties the only text block and the
+     *  host aborts an empty completed turn. Returns true when the retry stream
+     *  took over, in which case the caller drops the terminal event of the
+     *  attempt it came from. */
+    const retryEmptyTurn = async (reason: string | undefined): Promise<boolean> => {
+        if (degenerateRetried || refetch === undefined) return false;
+        if (visibleTextChars > 0 || sawToolUse) return false;
+        if (reason === undefined || !CLEAN_TURN_REASONS.has(reason)) return false;
+        if (res.destroyed || res.writableEnded) return false;
+        degenerateRetried = true;
+        log?.("[plugin] degenerate terminal turn (no visible output); retrying once with a continuation nudge (#732/#821)");
+        let next: ReadableStream<Uint8Array> | null = null;
+        try {
+            next = await refetch();
+        } catch (e) {
+            log?.(`[plugin] degenerate-terminal retry failed (${e instanceof Error ? e.message : String(e)}); passing the empty turn through`);
+            return false;
+        }
+        if (!next) return false;
+        // The turn is NOT over: the retry stream carries its own terminal, and a
+        // cut in it must still raise the truncation signal (#721).
+        sawTerminal = false;
+        finalFinishReason = undefined;
+        retryIndexOffset = blocksForwarded;
+        inRetry = true;
+        // The first attempt's held filter state belongs to text the client never
+        // saw (an emptying tag echo): the retry's content is filtered from
+        // scratch, so a partial tag there cannot swallow its opening characters.
+        streams.clear();
+        reader = next.getReader();
+        decoder = new TextDecoder("utf-8");
+        buf = "";
+        return true;
+    };
+    /** While the retry stream feeds the client, the message the FIRST attempt
+     *  opened is still open: nothing may re-open it. Returns true when the event
+     *  was consumed. */
+    const retryFraming = (ev: Record<string, unknown>): boolean => {
+        if (!inRetry) return false;
+        return ev["type"] === "message_start";
+    };
+    /** The retry's content blocks must land AFTER the ones the client already
+     *  saw. The offset is applied to the serialized payload — a processor with
+     *  nothing to strip forwards the original bytes, so rewriting only the parsed
+     *  event would leave the client's own index untouched. */
+    const offsetRetryIndices = (payload: string): string => {
+        if (!inRetry || retryIndexOffset === 0) return payload;
+        return payload
+            .split("\n")
+            .map((line) => {
+                if (!line.startsWith("data:")) return line;
+                const json = line.slice(5).trim();
+                if (!json.startsWith("{")) return line;
+                let o: Record<string, unknown>;
+                try {
+                    o = JSON.parse(json) as Record<string, unknown>;
+                } catch {
+                    return line;
+                }
+                if (typeof o["index"] !== "number" || !ANTHROPIC_BLOCK_EVENT.test(String(o["type"]))) return line;
+                o["index"] = (o["index"] as number) + retryIndexOffset;
+                return `data: ${JSON.stringify(o)}`;
+            })
+            .join("\n");
+    };
     const flushTails = (): string => {
         let out = "";
         for (const s of streams.values()) {
@@ -994,10 +1085,30 @@ export async function pipePluginChatWithStrip(
                         await write(rawEvent + "\n\n");
                         continue;
                     }
+                    if (retryFraming(ev)) continue;
+                    if (protocol === "anthropic" && ev["type"] === "content_block_start") blocksForwarded++;
                     if (ev["type"] === "message_stop") sawTerminal = true;
                     if (ev["type"] === "message_delta") {
                         const d = ev["delta"] as Record<string, unknown> | undefined;
                         if (d && typeof d["stop_reason"] === "string") finalFinishReason = d["stop_reason"] as string;
+                    }
+                    // Each wire declares its terminal on its own event: anthropic on
+                    // message_delta's stop_reason, openai on the finish_reason chunk
+                    // ([DONE] only closes the stream). Read here so the retry
+                    // decision can be taken before that event reaches the client.
+                    let turnTerminal: string | undefined;
+                    if (protocol === "anthropic" && ev["type"] === "message_delta") turnTerminal = finalFinishReason;
+                    else if (protocol === "openai") {
+                        const choices = ev["choices"];
+                        if (Array.isArray(choices)) {
+                            for (const c of choices) {
+                                const fr = c && typeof c === "object" ? (c as Record<string, unknown>)["finish_reason"] : undefined;
+                                if (typeof fr === "string" && fr.length > 0) {
+                                    finalFinishReason = fr;
+                                    turnTerminal = fr;
+                                }
+                            }
+                        }
                     }
                     const sample = usageFromSseEvent(ev);
                     if (sample) mergeUsageSample(acc, sample);
@@ -1006,7 +1117,12 @@ export async function pipePluginChatWithStrip(
                     // processors run and only rebuild when they return the event
                     // verbatim — otherwise their render-tag stripping is lost.
                     const out = protocol === "anthropic" ? processAnthropic(ev, rawEvent) : processOpenai(ev, rawEvent);
-                    if (out.length > 0) await write(out);
+                    // The gate runs AFTER this event is processed: a coalesced chunk
+                    // can carry content AND the finish reason, so its own text has to
+                    // count before the turn may be called empty. The event's output is
+                    // dropped only when the retry takes the turn over.
+                    if (turnTerminal !== undefined && (await retryEmptyTurn(turnTerminal))) continue;
+                    if (out.length > 0) await write(offsetRetryIndices(out));
                 }
             }
             if (res.destroyed || res.writableEnded) break;
@@ -1021,9 +1137,9 @@ export async function pipePluginChatWithStrip(
         // blank-line-delimited block — corrupting the truncation signal. Drop
         // it when the signal follows: an unterminated event is unparseable by
         // the client anyway (same as the pre-#721 bare end).
-        if (!truncated && buf.length > 0 && !res.destroyed && !res.writableEnded) await write(buf);
+        if (!truncated && buf.length > 0 && !res.destroyed && !res.writableEnded) await write(offsetRetryIndices(buf));
         const rest = flushTails();
-        if (rest.length > 0 && !res.destroyed && !res.writableEnded) await write(rest);
+        if (rest.length > 0 && !res.destroyed && !res.writableEnded) await write(offsetRetryIndices(rest));
         // Settle BEFORE res.end() in the finally below: the client can issue
         // its next request (e.g. /__bili/plugin/status, or the follow-up turn
         // that reads lastInputTokens for the nudge decision) the moment the
@@ -1050,7 +1166,7 @@ export async function pipePluginChatWithStrip(
         // written raw it would fuse with the signal frame.
         try {
             const rest = flushTails();
-            if (rest.length > 0) await write(rest);
+            if (rest.length > 0) await write(offsetRetryIndices(rest));
         } catch {
             /* client half-gone; the emission below is best-effort too */
         }
