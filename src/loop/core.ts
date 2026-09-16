@@ -555,6 +555,7 @@ export async function* runCompressLoop(
                             id: `acp_loop_r${round}_tool_${pr.callId}`,
                             role: "tool",
                             contentType: "tool-result",
+                            toolName: pr.name,
                             toolCallId: pr.callId,
                             text: pr.result,
                         });
