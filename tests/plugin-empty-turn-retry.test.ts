@@ -253,6 +253,41 @@ test("the continuation retry body carries the nudge as a trailing user turn", ()
     const appended = JSON.parse(injectContinuationNudge("openai", assistantLast)!) as { messages: { role: string }[] };
     assert.equal(appended.messages.length, 2, "a body ending on the assistant side gets a fresh user turn");
 
+    const googleBody = JSON.stringify({ contents: [{ role: "user", parts: [{ text: "hi" }] }] });
+    const google = JSON.parse(injectContinuationNudge("google", googleBody)!) as {
+        contents: { role: string; parts: { text: string }[] }[];
+    };
+    assert.equal(google.contents.length, 1, "google carries turns in contents; the nudge is a part on the last user turn");
+    assert.equal(google.contents[0]!.parts.length, 2);
+    assert.equal(google.contents[0]!.parts[0]!.text, "hi", "the original part is preserved");
+    assert.equal(google.contents[0]!.parts[1]!.text, DEGENERATE_RETRY_NUDGE);
+    assert.equal(injectContinuationNudge("google", JSON.stringify({ messages: [] })), null, "a body without contents is reported, not mangled");
+
     assert.equal(injectContinuationNudge("openai", JSON.stringify({ foo: 1 })), null, "unusable body is reported, not mangled");
     assert.equal(injectContinuationNudge("openai", "{not json"), null);
+});
+
+// The Google wire declares its terminal on the candidate that closes the
+// stream (`finishReason: "STOP"`), not on a `finish_reason` chunk, so the
+// retry gate has to read that spelling too — otherwise an echo-only Gemini
+// turn still arrives empty (the wire itself is #866/#867).
+function googleFrame(o: unknown): string {
+    return `data: ${JSON.stringify(o)}\n\n`;
+}
+
+test("plugin chat (google) retries a STOP turn whose only text was a stripped echo", async () => {
+    const out: string[] = [];
+    const res = makeRes(out);
+    let calls = 0;
+    const refetch = () => {
+        calls += 1;
+        return Promise.resolve(streamOf([googleFrame({ candidates: [{ index: 0, content: { role: "model", parts: [{ text: "recovered" }] }, finishReason: "STOP" }] })]));
+    };
+    const echoOnly = [
+        googleFrame({ candidates: [{ index: 0, content: { role: "model", parts: [{ text: `${TAG_OPEN}m00155${TAG_CLOSE}` }] } }] }),
+        googleFrame({ candidates: [{ index: 0, content: { role: "model", parts: [{ text: "" }] }, finishReason: "STOP" }], usageMetadata: { promptTokenCount: 40, candidatesTokenCount: 3 } }),
+    ];
+    await pipePluginChatWithStrip(streamOf(echoOnly), res, "google", undefined, undefined, refetch);
+    assert.equal(calls, 1, "the empty Gemini turn is re-asked once");
+    assert.ok(out.join("").includes("recovered"), `the client receives the retry's content, got: ${out.join("")}`);
 });

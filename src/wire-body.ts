@@ -34,6 +34,21 @@ export function appendTrailingUserText(protocol: WireProtocol, body: string | Bu
         }
         return JSON.stringify(obj);
     }
+    if (protocol === "google") {
+        // Gemini carries turns in `contents`, each with `parts`; the nudge is
+        // one more text part on the last user turn.
+        const contents = obj.contents;
+        if (!Array.isArray(contents)) return null;
+        const arr = contents as Record<string, unknown>[];
+        const last = arr[arr.length - 1];
+        if (last && typeof last === "object" && last.role === "user") {
+            const parts = last.parts;
+            last.parts = Array.isArray(parts) ? [...(parts as unknown[]), { text }] : [{ text }];
+        } else {
+            arr.push({ role: "user", parts: [{ text }] });
+        }
+        return JSON.stringify(obj);
+    }
     const messages = obj.messages;
     if (!Array.isArray(messages)) return null;
     const arr = messages as Record<string, unknown>[];
