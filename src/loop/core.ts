@@ -98,7 +98,7 @@ export interface RequestOptions {
 export type ParsedStreamEvent =
     | { kind: "text"; delta: string; raw?: Buffer }
     | { kind: "reasoning"; delta: string; raw?: Buffer; signature?: string; blockEnd?: boolean }
-    | { kind: "tool_call"; name: string; callId: string; arguments: string; passthrough?: boolean }
+    | { kind: "tool_call"; name: string; callId: string; arguments: string; passthrough?: boolean; signature?: string }
     | { kind: "usage"; inputTokens?: number; outputTokens?: number; cachedTokens?: number; creationTokens?: number }
     | { kind: "done"; finishReason?: string; suppressCompletion?: boolean; truncated?: boolean; thinking?: boolean }
     | { kind: "error"; message: string }
@@ -114,6 +114,10 @@ export interface ToolCallEmit {
     callId: string;
     arguments: string;
     passthrough?: boolean;
+    /** Protocol signature for the call part (Gemini thoughtSignature). A
+     *  reconstructed functionCall replayed without it is rejected by Gemini 3,
+     *  so it rides the call through to the re-request and to emitToolCall. */
+    signature?: string;
 }
 
 export interface ExtractedTextTriggers {
@@ -318,7 +322,7 @@ export async function* runCompressLoop(
                             }
                         }
                     } else if (ev.kind === "tool_call") {
-                        calls.push({ name: ev.name, callId: ev.callId, arguments: ev.arguments, passthrough: ev.passthrough });
+                        calls.push({ name: ev.name, callId: ev.callId, arguments: ev.arguments, passthrough: ev.passthrough, signature: ev.signature });
                     } else if (ev.kind === "usage") {
                         usage = {
                             inputTokens: ev.inputTokens,
@@ -461,7 +465,7 @@ export async function* runCompressLoop(
 
             let realCalls = 0;
             const realToolCalls: ToolCallEmit[] = [];
-            const proxyResults: { name: string; callId: string; result: string; arguments: string }[] = [];
+            const proxyResults: { name: string; callId: string; result: string; arguments: string; signature?: string }[] = [];
 
             for (const call of allCalls) {
                 if (isProxyToolFor(call.name, ctx.session, ctx.config)) {
@@ -472,7 +476,7 @@ export async function* runCompressLoop(
                         parsedArgs = {};
                     }
                     const result = executeProxyTool(call.name, parsedArgs, ctx, call.callId);
-                    proxyResults.push({ name: call.name, callId: call.callId, result, arguments: call.arguments });
+                    proxyResults.push({ name: call.name, callId: call.callId, result, arguments: call.arguments, signature: call.signature });
                     yield adapter.emitMarker(call.name, result);
                 } else {
                     realToolCalls.push(call);
@@ -498,15 +502,17 @@ export async function* runCompressLoop(
             // never in coreMessages), and hideConsumedCompressCalls runs each
             // round so consumed compress records cannot re-prime the model.
             if (proxyResults.length > 0) {
-                // #539: only Anthropic verifies thinking+signature pairs, so it alone
-                // needs a signature to replay a thinking block. OpenAI/DeepSeek and
-                // Responses echo reasoning_content back verbatim and emit no signature
-                // — gating on one dropped every such round's reasoning from the
-                // re-request, leaving the proxy-tool assistant message without
-                // reasoning_content (DeepSeek 400 invalid_request_error: "reasoning_
-                // content ... must be passed back"). Relies on the invariant that the
-                // single production call site (server.ts) always populates ctx.protocol.
-                const requiresThinkingSignature = ctx.protocol === "anthropic";
+                // #539: only wires that VERIFY thinking+signature pairs need a
+                // signature to replay a thinking block — Anthropic and Gemini 3
+                // (its thoughtSignature is rejected when dropped, same fatality).
+                // OpenAI/DeepSeek and Responses echo reasoning_content back
+                // verbatim and emit no signature — gating on one dropped every
+                // such round's reasoning from the re-request, leaving the
+                // proxy-tool assistant message without reasoning_content
+                // (DeepSeek 400 invalid_request_error: "reasoning_content ...
+                // must be passed back"). Relies on the invariant that the single
+                // production call site (server.ts) always populates ctx.protocol.
+                const requiresThinkingSignature = ctx.protocol === "anthropic" || ctx.protocol === "google";
                 if (reasoningSegments.length > 0) {
                     for (let i = 0; i < reasoningSegments.length; i++) {
                         const seg = reasoningSegments[i];
@@ -517,7 +523,11 @@ export async function* runCompressLoop(
                             contentType: "reasoning",
                             text: seg.text,
                             reasoningContent: seg.text,
-                            ...(seg.signature.length > 0 ? { thinkingSignature: seg.signature } : {}),
+                            ...(seg.signature.length > 0
+                                ? ctx.protocol === "google"
+                                    ? { googleThoughtSignature: seg.signature }
+                                    : { thinkingSignature: seg.signature }
+                                : {}),
                         };
                         coreMessages.push(reasoningMsg);
                     }
@@ -539,6 +549,7 @@ export async function* runCompressLoop(
                             toolName: pr.name,
                             toolCallId: pr.callId,
                             text: pr.arguments,
+                            ...(ctx.protocol === "google" && pr.signature ? { googleThoughtSignature: pr.signature } : {}),
                         });
                         coreMessages.push({
                             id: `acp_loop_r${round}_tool_${pr.callId}`,
@@ -697,16 +708,18 @@ export async function* runCompressLoop(
                     respResult = await fetchUpstream(newBody);
                 } catch (e) {
                     // #539 follow-up: stripping replayed thinking only recovers a
-                    // backend where thinking is OPTIONAL (Anthropic). On
-                    // OpenAI/DeepSeek thinking mode reasoning_content is MANDATORY,
-                    // so a strip-retry there guarantees another 400 plus a
-                    // misleading log — gate the degraded retry to Anthropic.
+                    // backend where thinking is OPTIONAL (Anthropic, and Gemini —
+                    // its thoughtSignature check is what a stripped replay drops).
+                    // On OpenAI/DeepSeek thinking mode reasoning_content is
+                    // MANDATORY, so a strip-retry there guarantees another 400 plus
+                    // a misleading log — gate the degraded retry to the wires that
+                    // verify signatures.
                     if (
                         !(e instanceof UpstreamHttpError) ||
                         e.status < 400 ||
                         e.status >= 500 ||
                         degradedRetried ||
-                        ctx.protocol !== "anthropic" ||
+                        (ctx.protocol !== "anthropic" && ctx.protocol !== "google") ||
                         !coreMessages.some(isLoopThinking)
                     ) {
                         throw e;

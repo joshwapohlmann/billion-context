@@ -39,6 +39,9 @@ export function fakeBufCap(): number {
 const ANTHROPIC_TOOL_BLOCK = /"type"\s*:\s*"tool_use"/;
 const OPENAI_TOOL_BLOCK = /"tool_calls"\s*:\s*\[\s*\{/;
 const RESPONSES_TOOL_BLOCK = /"type"\s*:\s*"function_call"/;
+// Gemini has no `type` discriminator: a real invocation is a functionCall PART
+// (`"functionCall":{"name":…}`) inside candidates[*].content.parts.
+const GOOGLE_TOOL_BLOCK = /"functionCall"\s*:\s*\{/;
 
 export function hasToolBlock(protocol: WireProtocol, rawText: string): boolean {
     switch (protocol) {
@@ -48,6 +51,8 @@ export function hasToolBlock(protocol: WireProtocol, rawText: string): boolean {
             return OPENAI_TOOL_BLOCK.test(rawText);
         case "responses":
             return RESPONSES_TOOL_BLOCK.test(rawText);
+        case "google":
+            return GOOGLE_TOOL_BLOCK.test(rawText);
     }
 }
 
@@ -105,6 +110,22 @@ export function injectFakeCompletionHint(protocol: WireProtocol, body: string | 
             else last.content = FAKE_COMPLETION_HINT;
         } else {
             arr.push({ role: "user", content: [{ type: "input_text", text: FAKE_COMPLETION_HINT }] });
+        }
+        return JSON.stringify(obj);
+    }
+    if (protocol === "google") {
+        // Gemini has no `messages` array: the conversation is `contents`, and a
+        // trailing user turn is `{role:"user", parts:[{text}]}`. Merge into the
+        // last user content when there is one (back-to-back user contents break
+        // the client's own replay grouping), else start a new one.
+        const contents = obj.contents;
+        if (!Array.isArray(contents)) return null;
+        const arr = contents as Record<string, unknown>[];
+        const last = arr[arr.length - 1];
+        if (last && typeof last === "object" && last.role === "user" && Array.isArray(last.parts)) {
+            last.parts = [...(last.parts as unknown[]), { text: FAKE_COMPLETION_HINT }];
+        } else {
+            arr.push({ role: "user", parts: [{ text: FAKE_COMPLETION_HINT }] });
         }
         return JSON.stringify(obj);
     }
