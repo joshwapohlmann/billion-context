@@ -751,8 +751,9 @@ function mergeUsageSample(acc: UsageSample, sample: UsageSample): void {
 /** Terminal reasons after which the model genuinely finished its turn. A
  *  refusal or a safety block must never be re-prompted, and a token-capped turn
  *  would only truncate again — so the degenerate-turn retry (#732/#821 for the
- *  plugin pipe) engages on these alone. */
-const CLEAN_TURN_REASONS = new Set(["stop", "end_turn", "stop_sequence"]);
+ *  plugin pipe) engages on these alone. `STOP` is the Google wire's spelling of
+ *  the same normal completion (see the warning's own terminalReason per wire). */
+const CLEAN_TURN_REASONS: Record<string, true> = { stop: true, end_turn: true, stop_sequence: true, STOP: true };
 
 const ANTHROPIC_BLOCK_EVENT = /^content_block_(start|delta|stop)$/;
 
@@ -842,7 +843,7 @@ export async function pipePluginChatWithStrip(
     const retryEmptyTurn = async (reason: string | undefined): Promise<boolean> => {
         if (degenerateRetried || refetch === undefined) return false;
         if (visibleTextChars > 0 || sawToolUse) return false;
-        if (reason === undefined || !CLEAN_TURN_REASONS.has(reason)) return false;
+        if (reason === undefined || CLEAN_TURN_REASONS[reason] !== true) return false;
         if (res.destroyed || res.writableEnded) return false;
         degenerateRetried = true;
         log?.("[plugin] degenerate terminal turn (no visible output); retrying once with a continuation nudge (#732/#821)");
@@ -1097,6 +1098,21 @@ export async function pipePluginChatWithStrip(
                         if (Array.isArray(choices)) {
                             for (const c of choices) {
                                 const fr = c && typeof c === "object" ? (c as Record<string, unknown>)["finish_reason"] : undefined;
+                                if (typeof fr === "string" && fr.length > 0) {
+                                    finalFinishReason = fr;
+                                    turnTerminal = fr;
+                                }
+                            }
+                        }
+                    } else if (protocol === "google") {
+                        // Gemini declares its terminal on the candidate that
+                        // closes the stream, not on a finish_reason chunk: an
+                        // echoed turn reaches `STOP` with no parts the filter
+                        // let through, exactly like the other wires' stop.
+                        const candidates = ev["candidates"];
+                        if (Array.isArray(candidates)) {
+                            for (const c of candidates) {
+                                const fr = c && typeof c === "object" ? (c as Record<string, unknown>)["finishReason"] : undefined;
                                 if (typeof fr === "string" && fr.length > 0) {
                                     finalFinishReason = fr;
                                     turnTerminal = fr;
