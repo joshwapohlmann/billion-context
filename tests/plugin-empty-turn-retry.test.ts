@@ -467,3 +467,49 @@ test("plugin chat: a retry stream that is cut still raises the truncation signal
     assert.ok(text.includes(TRUNC_MARKER), `a cut retry must still warn the client, got: ${text}`);
     assert.ok(text.includes("data: [DONE]"), "the stream is still terminated for the client");
 });
+
+/** The production shape of the unclosed-echo turn: the model opens a render tag,
+ *  writes its tool call inside it, and never closes the tag, so the span stays
+ *  pending and is released at the terminal. Reconstructed from the client-visible
+ *  residue of session 01a0ab88-a02e-7459-b278-56d7dbfe9746 at
+ *  2026-09-16T19:43:34.613Z; the wire bytes were not kept anywhere. */
+function unclosedEchoTurn(): string[] {
+    const pad = " ".repeat(120);
+    const residue = ` m00693</cp>${pad}\n${pad}\n <parameter name="i">Checking pocket CLI surface</｜｜DSML｜｜ parameter>`;
+    return [chatChunk({ role: "assistant" }), chatChunk({ content: `${TAG_OPEN}${residue}` }), chatStop(), DONE];
+}
+
+test("plugin chat retries a turn whose only visible output was an unclosed render tag", async () => {
+    const out: string[] = [];
+    let calls = 0;
+    const refetch = () => {
+        calls += 1;
+        return Promise.resolve(streamOf(proseTurn("real answer after the nudge")));
+    };
+    await pipePluginChatWithStrip(streamOf(unclosedEchoTurn()), makeRes(out), "openai", makeSession(), undefined, refetch);
+    const text = out.join("");
+    // The dropped tag's interior has already reached the client by the time the
+    // terminal arrives, so the retry cannot erase it: what the fix guarantees is
+    // that the turn carries content the host can act on, which is what the stall
+    // was missing.
+    assert.equal(calls, 1, "a tag interior is not visible output, so the turn is retried once");
+    assert.ok(
+        textDeltas(text, "openai").endsWith("real answer after the nudge"),
+        "the retry's content reaches the client after the residue",
+    );
+});
+
+test("plugin chat emits an in-band error when the retry degenerates too", async () => {
+    const out: string[] = [];
+    const refetch = () => Promise.resolve(streamOf([chatChunk({ role: "assistant" }), chatStop(), DONE]));
+    await pipePluginChatWithStrip(streamOf(unclosedEchoTurn()), makeRes(out), "openai", makeSession(), undefined, refetch);
+    const text = out.join("");
+    assert.ok(
+        text.includes("[ACP] stream error"),
+        "the client is told, rather than left with an empty turn the host never reports",
+    );
+    // The error block closes the turn for the client; the retry stream's own
+    // terminator still follows it, which the client ignores because it stopped at
+    // the error's.
+    assert.equal((text.match(/\[DONE\]/g) ?? []).length, 2, "the error's terminal, then the retry's trailing terminator");
+});
