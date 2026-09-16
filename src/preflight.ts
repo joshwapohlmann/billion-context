@@ -661,6 +661,16 @@ async function requestSummaryBody(deps: PreflightDeps, body: string): Promise<st
     }
 }
 
+// #829: the body's shape decides how a summary reply is read, not the requested
+// `stream` flag. The flag covers upstreams that answer a stream:true call with
+// plain JSON; the mirror case is just as real — the Gemini wire posts its
+// summary call to the client's own `:streamGenerateContent` URL, which answers
+// SSE whatever the request says (the Gemini payload has no `stream` field to
+// turn it off). An SSE body that is never parsed reads as an empty summary, so
+// every call in the per-request budget is spent for nothing and the turn
+// fail-fasts with "context exceeds the model window" instead of compressing.
+const SSE_DATA_LINE_RE = /(?:^|\n)data:/;
+
 async function requestSummary(deps: PreflightDeps, system: string, content: string, stream: boolean, includeMaxOutputTokens: boolean): Promise<SummaryOutcome> {
     const text = await requestSummaryBody(deps, JSON.stringify(summaryPayload(deps.protocol, deps.model, system, content, stream, includeMaxOutputTokens)));
     let json: unknown;
@@ -670,13 +680,15 @@ async function requestSummary(deps: PreflightDeps, system: string, content: stri
         json = null;
     }
     // Streaming bodies are SSE, but a non-conforming upstream may answer a
-    // stream:true call with plain JSON — accept either shape.
+    // stream:true call with plain JSON — accept either shape, and likewise for
+    // a non-stream call answered with SSE (#829).
+    const sseBody = SSE_DATA_LINE_RE.test(text);
     const summary = (json && typeof json === "object"
         ? extractSummaryText(deps.protocol, json as Record<string, unknown>)
-        : stream
+        : stream || sseBody
             ? extractSummaryFromSse(deps.protocol, text)
             : "").trim();
-    if (!json && !stream) {
+    if (!json && !stream && !sseBody) {
         deps.log("warn", `[preflight] summary response was not JSON: ${text.slice(0, 200)}`);
     }
     if (summary.length < MIN_SUMMARY_CHARS) {
