@@ -25,14 +25,14 @@ import { lastCompressSuffix, type Session } from "./session.js";
 // summarization calls sized to fit the smaller window, before the payload is
 // forwarded.
 
-const MAX_PREFLIGHT_ROUNDS = 8;
+const MAX_PREFLIGHT_ROUNDS = 16;
 const CHUNK_FRACTION = 0.6;
 const MIN_CHUNK_TOKENS = 2000;
 const MIN_SUMMARY_CHARS = 50;
 const MAX_SUMMARY_OUTPUT_TOKENS = 8192;
 // #574: bound on upstream summarization calls per invocation — the multi-range
 // walk can otherwise spend a call per viable range in a block-dense history.
-const MAX_SUMMARY_CALLS_PER_PREFLIGHT = 8;
+export const MAX_SUMMARY_CALLS_PER_PREFLIGHT = 16;
 
 export type PreflightProtocol = "anthropic" | "openai" | "responses" | "google";
 
