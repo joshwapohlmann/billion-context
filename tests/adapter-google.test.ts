@@ -333,3 +333,19 @@ test("google parseStream: an edited text frame carries no sibling proxy call", a
     assert.equal(leaked.length, 0, `no frame may carry the prose and the proxy call together, got: ${leaked.join(" | ")}`);
     assert.equal(frames.filter((f) => f.includes("kept prose")).length, 1, `the surviving prose still arrives once, got: ${frames.join(" | ")}`);
 });
+
+// A malformed upstream chunk can carry a null where a part object belongs. The
+// edited copy filters sibling call parts out of the chunk, so it has to tolerate
+// a null rather than dereference it: before the guard, this threw mid-stream and
+// took the turn down with it.
+test("google parseStream: a null sibling part does not break the edited frame", async () => {
+    const adapter = createGoogleAdapter(REQUEST_BODY, "client system", "bili_absorb", "gemini-3-pro-preview");
+    const TAG = "\x3cacp tokens=\"1\" type=\"text\"\x3e";
+    const CLOSE = "\x3c/acp\x3e";
+    const events = await collect(
+        adapter,
+        sse({ candidates: [{ content: { role: "model", parts: [{ text: `${TAG}m00155${CLOSE} kept prose` }, null] } }] }),
+    );
+    const frames = framesOf(events);
+    assert.ok(frames.some((f) => f.includes("kept prose")), `the prose still reaches the client, got: ${frames.join(" | ")}`);
+});
