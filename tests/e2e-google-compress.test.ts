@@ -63,7 +63,72 @@ type RelayState = {
     toolsInjected: number;
     systemForwarded: number;
     foldedReqs: number;
+    shapeViolations: string[];
 };
+
+/** Narrows parsed JSON to an object for checked member access. */
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+    return value !== null && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : undefined;
+}
+
+/** Gemini's request contract, to the depth the wire can violate it. The real
+ *  API answers a violation with a generic `400 INVALID_ARGUMENT`, so the mock
+ *  has to be the strict one: a nameless or mismatched `functionResponse`, an
+ *  empty `parts` array, a repeated role, or a signature on a user part all
+ *  make the whole request unusable — exactly what a lenient mock hides. */
+function geminiShapeViolations(body: string): string[] {
+    const problems: string[] = [];
+    let parsed: unknown;
+    try {
+        parsed = JSON.parse(body);
+    } catch {
+        return ["body is not JSON"];
+    }
+    const root = asRecord(parsed);
+    const contents = root && Array.isArray(root.contents) ? root.contents : undefined;
+    if (!contents) return ["contents is not an array"];
+    const callNames = new Set<string>();
+    let previousRole: string | undefined;
+    contents.forEach((entry, i) => {
+        const content = asRecord(entry);
+        if (!content) {
+            problems.push(`content[${i}] is not an object`);
+            return;
+        }
+        const role = typeof content.role === "string" ? content.role : "";
+        if (role !== "user" && role !== "model") problems.push(`content[${i}] role=${JSON.stringify(content.role)}`);
+        if (role === previousRole) problems.push(`content[${i}] repeats role ${role} — Gemini needs alternating roles`);
+        previousRole = role;
+        const parts = Array.isArray(content.parts) ? content.parts : undefined;
+        if (!parts) {
+            problems.push(`content[${i}] has no parts array`);
+            return;
+        }
+        if (parts.length === 0) problems.push(`content[${i}] has an empty parts array`);
+        parts.forEach((entry2, j) => {
+            const part = asRecord(entry2);
+            if (!part) {
+                problems.push(`content[${i}].parts[${j}] is not an object`);
+                return;
+            }
+            const payloads = ["text", "inlineData", "fileData", "functionCall", "functionResponse"].filter((k) => k in part);
+            if (payloads.length === 0) problems.push(`content[${i}].parts[${j}] carries no payload`);
+            if (part.thoughtSignature !== undefined && role !== "model") problems.push(`content[${i}].parts[${j}] carries a thoughtSignature on a ${role} part`);
+            const call = asRecord(part.functionCall);
+            if (call) {
+                if (typeof call.name !== "string" || call.name.length === 0) problems.push(`content[${i}].parts[${j}] functionCall without a name`);
+                else callNames.add(call.name);
+            }
+            const response = asRecord(part.functionResponse);
+            if (response) {
+                if (typeof response.name !== "string" || response.name.length === 0) problems.push(`content[${i}].parts[${j}] functionResponse without a name`);
+                else if (!callNames.has(response.name)) problems.push(`content[${i}].parts[${j}] functionResponse name=${response.name} answers no call (calls seen: ${[...callNames].join(",") || "none"})`);
+                if (asRecord(response.response) === undefined) problems.push(`content[${i}].parts[${j}] functionResponse.response is not an object`);
+            }
+        });
+    });
+    return problems;
+}
 
 function parseRefIds(body: string): string[] {
     const ids: string[] = [];
@@ -89,6 +154,7 @@ function startMockGemini(state: RelayState, threshold: number = LIVE_BYTES_THRES
             } catch {
                 contents = 0;
             }
+            for (const problem of geminiShapeViolations(body)) state.shapeViolations.push(`req ${state.upstreamReqs.length + 1}: ${problem}`);
             if (body.includes("Compression FAILED")) state.failedCompressions++;
             if (body.includes('"functionDeclarations"') && body.includes('"compress"')) state.toolsInjected++;
             if (body.includes("you are a test assistant")) state.systemForwarded++;
@@ -213,7 +279,7 @@ async function runConversation(url: string, headers: Record<string, string>, sta
 test("e2e google: session-identified Gemini stream compresses and keeps the upstream payload bounded", async () => {
     _setStoreForTest(new SessionStore({ enabled: false }));
     setRegistryForTest({});
-    const state: RelayState = { upstreamReqs: [], compressCalls: 0, failedCompressions: 0, lastDemandBytes: Infinity, sinceDemand: 99, toolsInjected: 0, systemForwarded: 0, foldedReqs: 0 };
+    const state: RelayState = { upstreamReqs: [], compressCalls: 0, failedCompressions: 0, lastDemandBytes: Infinity, sinceDemand: 99, toolsInjected: 0, systemForwarded: 0, foldedReqs: 0, shapeViolations: [] };
     const upstream = startMockGemini(state);
     await listen(upstream);
     const upstreamPort = (upstream.address() as { port: number }).port;
@@ -232,6 +298,7 @@ test("e2e google: session-identified Gemini stream compresses and keeps the upst
         assert.ok(state.upstreamReqs.length >= TURNS, `expected at least one upstream request per turn, got ${state.upstreamReqs.length}`);
         assert.ok(state.upstreamReqs.length < TURNS * 2, `compress rounds must not spiral (${state.upstreamReqs.length} requests for ${TURNS} turns)`);
         assert.equal(state.failedCompressions, 0, "compress tool calls must not fail");
+        assert.equal(state.shapeViolations.length, 0, `every rebuilt Gemini request must satisfy the API contract: ${state.shapeViolations.slice(0, 4).join(" | ")}`);
         assert.equal(state.toolsInjected, state.upstreamReqs.length, "the ACP tool declarations must be injected on every request");
         assert.equal(state.systemForwarded, state.upstreamReqs.length, "the client's systemInstruction must survive every rebuild");
         assert.ok(state.compressCalls >= 2, `expected >= 2 compress cycles, got ${state.compressCalls}`);
@@ -252,7 +319,7 @@ test("e2e google: session-identified Gemini stream compresses and keeps the upst
 test("e2e google: an anonymous Gemini client (no headers, omp's shape) attaches by prefix affinity and still compresses", async () => {
     _setStoreForTest(new SessionStore({ enabled: false }));
     setRegistryForTest({});
-    const state: RelayState = { upstreamReqs: [], compressCalls: 0, failedCompressions: 0, lastDemandBytes: Infinity, sinceDemand: 99, toolsInjected: 0, systemForwarded: 0, foldedReqs: 0 };
+    const state: RelayState = { upstreamReqs: [], compressCalls: 0, failedCompressions: 0, lastDemandBytes: Infinity, sinceDemand: 99, toolsInjected: 0, systemForwarded: 0, foldedReqs: 0, shapeViolations: [] };
     const upstream = startMockGemini(state);
     await listen(upstream);
     const upstreamPort = (upstream.address() as { port: number }).port;
@@ -265,6 +332,7 @@ test("e2e google: an anonymous Gemini client (no headers, omp's shape) attaches 
         const { replies } = await runConversation(url, {}, state);
         assert.ok(state.upstreamReqs.length >= TURNS && state.upstreamReqs.length < TURNS * 2, `request count must reflect the compress rounds (${state.upstreamReqs.length} for ${TURNS} turns)`);
         assert.equal(state.failedCompressions, 0, "compress tool calls must not fail");
+        assert.equal(state.shapeViolations.length, 0, `every rebuilt Gemini request must satisfy the API contract: ${state.shapeViolations.slice(0, 4).join(" | ")}`);
         assert.ok(state.compressCalls >= 2, `expected >= 2 compress cycles without any client identity signal, got ${state.compressCalls}`);
         for (const [i, reply] of replies.entries()) {
             assert.ok(reply.text.length > 0, `turn ${i + 1}: the model reply must not be empty`);
@@ -281,7 +349,7 @@ const PLUGIN_TURNS = 8;
 test("e2e google: plugin mode (omp) keeps the agent's tool call, credits usage and ends the stream cleanly", async () => {
     _setStoreForTest(new SessionStore({ enabled: false }));
     setRegistryForTest({});
-    const state: RelayState = { upstreamReqs: [], compressCalls: 0, failedCompressions: 0, lastDemandBytes: Infinity, sinceDemand: 99, toolsInjected: 0, systemForwarded: 0, foldedReqs: 0 };
+    const state: RelayState = { upstreamReqs: [], compressCalls: 0, failedCompressions: 0, lastDemandBytes: Infinity, sinceDemand: 99, toolsInjected: 0, systemForwarded: 0, foldedReqs: 0, shapeViolations: [] };
     const upstream = startMockGemini(state, 2 * 1024);
     await listen(upstream);
     const upstreamPort = (upstream.address() as { port: number }).port;
@@ -323,6 +391,7 @@ test("e2e google: plugin mode (omp) keeps the agent's tool call, credits usage a
         // ACP tools host-side, so the upstream never sees them.
         assert.equal(state.toolsInjected, 0, "plugin mode must not inject ACP tools into the wire body");
         assert.equal(state.failedCompressions, 0, "no compress failure marker");
+        assert.equal(state.shapeViolations.length, 0, `plugin-mode bodies must satisfy the API contract too: ${state.shapeViolations.slice(0, 4).join(" | ")}`);
         // Usage sniffing is what keeps lastInputTokens (and therefore the nudge)
         // alive on this wire: the mock always reports promptTokenCount=1000.
         const googleSession = listSessions().find((s) => s.meta.protocol === "google");
