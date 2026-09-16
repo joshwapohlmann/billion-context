@@ -463,3 +463,18 @@ test("plugin chat retries a turn whose only visible output was an unclosed rende
         "the retry's content reaches the client after the residue",
     );
 });
+
+test("plugin chat emits an in-band error when the retry degenerates too", async () => {
+    const out: string[] = [];
+    const refetch = () => Promise.resolve(streamOf([chatChunk({ role: "assistant" }), chatStop(), DONE]));
+    await pipePluginChatWithStrip(streamOf(unclosedEchoTurn()), makeRes(out), "openai", makeSession(), undefined, refetch);
+    const text = out.join("");
+    assert.ok(
+        text.includes("[ACP] stream error"),
+        "the client is told, rather than left with an empty turn the host never reports",
+    );
+    // The error block closes the turn for the client; the retry stream's own
+    // terminator still follows it, which the client ignores because it stopped at
+    // the error's.
+    assert.equal((text.match(/\[DONE\]/g) ?? []).length, 2, "the error's terminal, then the retry's trailing terminator");
+});

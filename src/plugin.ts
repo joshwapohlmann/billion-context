@@ -11,7 +11,7 @@ import { executeProxyTool } from "./loop/core.js";
 import { normalizeSseLineEndings } from "./sse-util.js";
 import { composeStreamFilters, containsMarkerLineText, containsRenderTagText, createMarkerLineFilter, createTagEchoFilter, mayStartMarkerLine, mayStartRenderTag, stripAnthropicText, stripOpenaiChatText, stripResponsesText, type TagEchoFilter } from "./loop/tag-echo-filter.js";
 import { log as loggerLog } from "./logger.js";
-import { emitUpstreamTruncation } from "./stream-error.js";
+import { emitStreamError, emitUpstreamTruncation } from "./stream-error.js";
 import { degenerateTurnWarning } from "./degenerate-turn.js";
 import { noteWeakOverflow } from "./weak-overflow.js";
 import { warnCacheCollapse } from "./cache-warn.js";
@@ -854,12 +854,20 @@ export async function pipePluginChatWithStrip(
      *  took over, in which case the caller drops the terminal event of the
      *  attempt it came from. */
     const retryEmptyTurn = async (reason: string | undefined): Promise<boolean> => {
-        if (degenerateRetried || refetch === undefined) return false;
+        if (refetch === undefined) return false;
         // Markup released from a held span carries nothing the host can act on:
         // an unclosed render tag stalls the turn exactly like an empty one.
         if (visibleTextChars > releasedMarkupChars || sawToolUse) return false;
         if (reason === undefined || !CLEAN_TURN_REASONS.has(reason)) return false;
         if (res.destroyed || res.writableEnded) return false;
+        if (degenerateRetried) {
+            // The retry degenerated too. An empty turn is indistinguishable from a
+            // model that produced nothing and the session reads as idle while it is
+            // dead, so the client gets an error the host would never surface (#870).
+            log?.("[plugin] degenerate terminal turn again after the retry; emitting an in-band error (#870)");
+            emitStreamError(res, protocol, "the turn degenerated again after the continuation nudge");
+            return true;
+        }
         degenerateRetried = true;
         log?.("[plugin] degenerate terminal turn (no usable output); retrying once with a continuation nudge (#732/#821)");
         let next: ReadableStream<Uint8Array> | null = null;
