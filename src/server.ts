@@ -3864,7 +3864,26 @@ async function forward(
             }
             if (prepared.stream) {
                 if (prepared.protocol === "responses") {
-                    await pipePluginResponsesWithStrip(pluginBody, res, prepared.session, (msg) => log("info", `[${prepared.session.id}] ${msg}`));
+                    // #732/#821 applies to this pipe too (#871): the agent's own
+                    // body, held here with its URL and headers, is re-issued once
+                    // when the turn completes with nothing visible.
+                    await pipePluginResponsesWithStrip(
+                        pluginBody,
+                        res,
+                        prepared.session,
+                        (msg) => log("info", `[${prepared.session.id}] ${msg}`),
+                        makeContinuationRefetch({
+                            protocol: "responses",
+                            body,
+                            upstreamUrl,
+                            reqHeaders: buildForwardHeaders(headers),
+                            proxyUrl,
+                            dispatcher,
+                            signal: clientAbort.signal,
+                            log,
+                            label: prepared.session.id,
+                        }),
+                    );
                 } else {
                     // #732/#821: the plugin pipe re-issues the agent's own body
                     // once when a turn ends with nothing visible (the render-tag
@@ -3968,7 +3987,23 @@ async function forward(
             // Responses stream. Same pipe as the non-injected branch below;
             // no session, so usage accounting stays off.
             if ((upstream.headers.get("content-type") ?? "").includes("text/event-stream")) {
-                await pipePluginResponsesWithStrip(toClient, res, undefined, tagLog);
+                await pipePluginResponsesWithStrip(
+                    toClient,
+                    res,
+                    undefined,
+                    tagLog,
+                    makeContinuationRefetch({
+                        protocol: "responses",
+                        body,
+                        upstreamUrl,
+                        reqHeaders: buildForwardHeaders(headers),
+                        proxyUrl,
+                        dispatcher,
+                        signal: clientAbort.signal,
+                        log,
+                        label: prepared.session.id,
+                    }),
+                );
             } else {
                 await pipeThrough(toClient, res);
             }
@@ -3992,7 +4027,23 @@ async function forward(
             const p = prepared;
             const tagLog = (msg: string) => log("info", `[${p.session.id}] ${msg}`);
             if (p.protocol === "responses") {
-                await pipePluginResponsesWithStrip(responseBody, res, undefined, tagLog);
+                await pipePluginResponsesWithStrip(
+                    responseBody,
+                    res,
+                    undefined,
+                    tagLog,
+                    makeContinuationRefetch({
+                        protocol: "responses",
+                        body,
+                        upstreamUrl,
+                        reqHeaders: buildForwardHeaders(headers),
+                        proxyUrl,
+                        dispatcher,
+                        signal: clientAbort.signal,
+                        log,
+                        label: p.session.id,
+                    }),
+                );
             } else {
                 await pipePluginChatWithStrip(
                     responseBody,
