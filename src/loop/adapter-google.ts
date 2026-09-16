@@ -477,7 +477,7 @@ export function createGoogleAdapter(
                         raw = sseFrame(cloneChunk(parsed, {
                             parts: parts
                                 .map((p, j) => (j === i ? { ...p, text: clean } : p))
-                                .filter((p) => p.functionCall === undefined),
+                                .filter((p) => !p || typeof p !== "object" || p.functionCall === undefined),
                             dropFinishReason: true,
                         }));
                     }
