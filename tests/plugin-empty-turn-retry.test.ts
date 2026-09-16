@@ -287,6 +287,9 @@ function responsesProseTurn(text: string, responseId = "resp_2", itemId = "item_
         sse("response.content_part.added", { type: "response.content_part.added", item_id: itemId, output_index: 0, part: { type: "output_text", text: "" } }),
         sse("response.output_text.delta", { type: "response.output_text.delta", item_id: itemId, output_index: 0, delta: text }),
         sse("response.output_text.done", { type: "response.output_text.done", item_id: itemId, output_index: 0, text }),
+        // The frame that carries the item's identity NESTED rather than as
+        // `item_id`: it reaches the client, so it must be rewritten too.
+        sse("response.output_item.done", { type: "response.output_item.done", output_index: 0, item: { id: itemId, type: "message", content: [{ type: "output_text", text }] } }),
         sse(status === "completed" ? "response.completed" : "response.failed", {
             type: status === "completed" ? "response.completed" : "response.failed",
             response: { id: responseId, status, output: [{ id: itemId, type: "message", content: [{ type: "output_text", text }] }] },

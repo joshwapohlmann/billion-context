@@ -1356,6 +1356,13 @@ export async function pipePluginResponsesWithStrip(
         if (!inRetry) return;
         if (heldItemId !== undefined) ev["item_id"] = heldItemId;
         if (heldOutputIndex !== undefined) ev["output_index"] = heldOutputIndex;
+        // `response.output_item.*` carries the item's identity nested as `item.id`
+        // rather than `item_id`. The done event is released to the client, so
+        // without this the client watches the item it holds be replaced.
+        const item = ev["item"];
+        if (heldItemId !== undefined && item && typeof item === "object") {
+            (item as Record<string, unknown>)["id"] = heldItemId;
+        }
         const resp = ev["response"];
         if (!resp || typeof resp !== "object") return;
         const r = resp as Record<string, unknown>;
