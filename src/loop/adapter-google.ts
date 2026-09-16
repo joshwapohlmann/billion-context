@@ -82,7 +82,7 @@ function cloneChunk(
     const candidate = { ...candidates[0] };
     if (edit.dropFinishReason) delete candidate.finishReason;
     if (edit.parts) {
-        candidate.content = { ...(candidate.content as Record<string, unknown> | undefined), parts: edit.parts };
+        candidate.content = { role: "model", ...(candidate.content as Record<string, unknown> | undefined), parts: edit.parts };
     }
     return { ...parsed, candidates: [candidate, ...candidates.slice(1)] };
 }
@@ -426,6 +426,13 @@ export function createGoogleAdapter(
                 }
 
                 const callIndexes: number[] = [];
+                // Whether THIS chunk carries a functionCall part anywhere, not
+                // only before the part being forwarded: a chunk that will be
+                // replayed whole at settle must not also hand the client its
+                // text or reasoning now, and its sibling call parts must not
+                // ride along in an edited copy (a proxy call would leak there
+                // even when settle drops the chunk).
+                const hasCallPart = parts.some((p) => p && typeof p === "object" && p.functionCall !== undefined);
                 let emitted = false;
                 for (let i = 0; i < parts.length; i++) {
                     const part = parts[i];
@@ -447,10 +454,11 @@ export function createGoogleAdapter(
                     if (part.thought === true) {
                         sawReasoning = true;
                         emitted = true;
+                        const reasoningRaw = !hasCallPart ? (finishReason ? sseFrame(cloneChunk(parsed, { dropFinishReason: true })) : rawBuf) : undefined;
                         yield {
                             kind: "reasoning",
                             delta: part.text,
-                            raw: finishReason ? sseFrame(cloneChunk(parsed, { dropFinishReason: true })) : rawBuf,
+                            ...(reasoningRaw ? { raw: reasoningRaw } : {}),
                             ...(typeof part.thoughtSignature === "string" && part.thoughtSignature.length > 0
                                 ? { signature: part.thoughtSignature }
                                 : {}),
@@ -464,10 +472,12 @@ export function createGoogleAdapter(
                     if (clean === part.text) {
                         // A chunk that also carries functionCall parts is replayed
                         // whole at settle, so its text must not be forwarded twice.
-                        if (callIndexes.length === 0) raw = finishReason ? sseFrame(cloneChunk(parsed, { dropFinishReason: true })) : rawBuf;
+                        if (!hasCallPart) raw = finishReason ? sseFrame(cloneChunk(parsed, { dropFinishReason: true })) : rawBuf;
                     } else {
                         raw = sseFrame(cloneChunk(parsed, {
-                            parts: parts.map((p, j) => (j === i ? { ...p, text: clean } : p)),
+                            parts: parts
+                                .map((p, j) => (j === i ? { ...p, text: clean } : p))
+                                .filter((p) => p.functionCall === undefined),
                             dropFinishReason: true,
                         }));
                     }
