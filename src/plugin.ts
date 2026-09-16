@@ -1208,15 +1208,23 @@ function hadTextOtherThanTextFields(choices: unknown): boolean {
  *
  *  Also serves proxy-mode Responses SSE that skipped compress injection
  *  (#460, e.g. ACP_NO_INJECT_TOOL). Pass no session there — see
- *  pipePluginChatWithStrip for why usage accounting must be skipped. */
+ *  pipePluginChatWithStrip for why usage accounting must be skipped.
+ *
+ *  #732/#821 parity with pipePluginChatWithStrip: when the turn's completion
+ *  reports a clean status with nothing visible — the echoed render tag was the
+ *  only thing the model emitted, and the filter emptied it — the agent's own
+ *  body is re-issued ONCE with a continuation nudge instead of leaving the host
+ *  with an empty completed turn. The retry is reframed onto the ids the client
+ *  already holds, so the client still sees one turn. */
 export async function pipePluginResponsesWithStrip(
     stream: ReadableStream<Uint8Array>,
-    res: import("node:http").ServerResponse,
+    res: ServerResponse,
     session?: Session,
     log?: (msg: string) => void,
+    refetch?: () => Promise<ReadableStream<Uint8Array> | null>,
 ): Promise<void> {
-    const reader = stream.getReader();
-    const decoder = new TextDecoder("utf-8");
+    let reader = stream.getReader();
+    let decoder = new TextDecoder("utf-8");
     let buf = "";
     const acc: UsageSample = {};
     const tagFilter = composeStreamFilters(
@@ -1233,6 +1241,23 @@ export async function pipePluginResponsesWithStrip(
     let sawFunctionCall = false;
     let sawReasoning = false;
     let responseStatus: string | undefined;
+    // Degenerate-turn retry (#732/#821 for this pipe). The first attempt's
+    // done-family events are HELD until its completion event decides the turn:
+    // released in place on a healthy turn, dropped whole when the retry takes
+    // over, so the client sees one turn carrying one set of ids.
+    let degenerateRetried = false;
+    let inRetry = false;
+    /** Text the client actually assembled from this attempt's deltas. */
+    let visibleTextChars = 0;
+    /** Done-family events held for the attempt in flight. */
+    let heldEvents: string[] = [];
+    /** Text those held events would hand the client, post-strip. */
+    let heldVisibleChars = 0;
+    /** The ids the client already holds (first attempt), which the retry's own
+     *  created/added events are dropped in favour of. */
+    let heldItemId: unknown;
+    let heldOutputIndex: unknown;
+    let heldResponseId: unknown;
     const write = (s: string): Promise<void> => {
         if (!res.write(Buffer.from(s, "utf8"))) {
             return new Promise<void>((r) => res.once("drain", () => r()));
@@ -1278,10 +1303,98 @@ export async function pipePluginResponsesWithStrip(
     const flushTail = (after: string) => {
         const tail = tagFilter.flush();
         if (tail.length > 0) {
-            const meta = lastDeltaMeta ?? {};
+            visibleTextChars += tail.length;
+            const meta = inRetry && heldItemId !== undefined ? { item_id: heldItemId, output_index: heldOutputIndex } : (lastDeltaMeta ?? {});
             return `data: ${JSON.stringify({ type: "response.output_text.delta", ...meta, delta: tail })}\n\n` + after;
         }
         return after;
+    };
+    /** Visible (post-strip) text a done-family event carries — what the client
+     *  would assemble from it. It decides the turn's degeneracy together with
+     *  the deltas already forwarded. */
+    const responsesEventTextLength = (ev: Record<string, unknown>): number => {
+        let text = typeof ev["text"] === "string" ? (ev["text"] as string) : "";
+        const part = ev["part"];
+        if (part && typeof part === "object" && typeof (part as Record<string, unknown>)["text"] === "string") {
+            text += (part as Record<string, unknown>)["text"] as string;
+        }
+        const item = ev["item"];
+        const content = item && typeof item === "object" ? (item as Record<string, unknown>)["content"] : undefined;
+        if (Array.isArray(content)) {
+            for (const c of content) {
+                if (c && typeof c === "object" && typeof (c as Record<string, unknown>)["text"] === "string") {
+                    text += (c as Record<string, unknown>)["text"] as string;
+                }
+            }
+        }
+        return text.length;
+    };
+    /** Whether a serialized event must be rebuilt rather than forwarded: the
+     *  retry's ids are rewritten in the parsed event, and a processor with
+     *  nothing to strip forwards the original bytes, which would leave them
+     *  untouched. */
+    const retryRewritePending = (): boolean =>
+        inRetry && (heldItemId !== undefined || heldOutputIndex !== undefined || heldResponseId !== undefined);
+    /** While the retry stream feeds the client, the framing the FIRST attempt
+     *  opened is still open: the retry's own created/added events would hand the
+     *  client a second set of ids, so they are dropped. Returns true when the
+     *  event was consumed. */
+    const retryFraming = (type: unknown): boolean => {
+        if (!inRetry) return false;
+        return type === "response.created" || type === "response.output_item.added" || type === "response.content_part.added";
+    };
+    /** Every id the retry carries is rewritten onto the first attempt's, so the
+     *  client's assembled item stays the one it already holds. */
+    const rewriteRetryIds = (ev: Record<string, unknown>): void => {
+        if (!inRetry) return;
+        if (heldItemId !== undefined) ev["item_id"] = heldItemId;
+        if (heldOutputIndex !== undefined) ev["output_index"] = heldOutputIndex;
+        const resp = ev["response"];
+        if (!resp || typeof resp !== "object") return;
+        const r = resp as Record<string, unknown>;
+        if (heldResponseId !== undefined) r["id"] = heldResponseId;
+        const output = r["output"];
+        if (heldItemId !== undefined && Array.isArray(output)) {
+            for (const item of output) {
+                if (item && typeof item === "object") (item as Record<string, unknown>)["id"] = heldItemId;
+            }
+        }
+    };
+    /** One-shot re-issue when a Responses turn reaches its completion with
+     *  nothing visible: the tag-echo case, where the filter empties the only
+     *  text the model emitted and the host aborts an empty completed turn.
+     *  Returns true when the retry stream took over, in which case the caller
+     *  drops the held done-family events AND the completion it came from. */
+    const retryEmptyTurn = async (status: string | undefined): Promise<boolean> => {
+        if (degenerateRetried || refetch === undefined) return false;
+        if (visibleTextChars > 0 || heldVisibleChars > 0 || sawFunctionCall) return false;
+        if (status !== "completed") return false;
+        if (res.destroyed || res.writableEnded) return false;
+        degenerateRetried = true;
+        log?.("[plugin] degenerate terminal turn (no visible output); retrying once with a continuation nudge (#732/#821)");
+        let next: ReadableStream<Uint8Array> | null = null;
+        try {
+            next = await refetch();
+        } catch (e) {
+            log?.(`[plugin] degenerate-terminal retry failed (${e instanceof Error ? e.message : String(e)}); passing the empty turn through`);
+            return false;
+        }
+        if (!next) return false;
+        // The turn is NOT over: the retry carries its own terminal, and a cut in
+        // it must still raise the truncation signal (#721).
+        sawTerminal = false;
+        responseStatus = undefined;
+        heldEvents = [];
+        heldVisibleChars = 0;
+        inRetry = true;
+        // The first attempt's held filter state belongs to text the client never
+        // saw (an emptying tag echo): the retry's content is filtered from
+        // scratch, so a partial tag there cannot swallow its opening characters.
+        tagFilter.flush();
+        reader = next.getReader();
+        decoder = new TextDecoder("utf-8");
+        buf = "";
+        return true;
     };
     try {
         for (;;) {
@@ -1320,22 +1433,51 @@ export async function pipePluginResponsesWithStrip(
                         }
                         const resp = ev["response"] as Record<string, unknown> | undefined;
                         if (resp && typeof resp["status"] === "string") responseStatus = resp["status"] as string;
+                        if (!inRetry) {
+                            // The ids the client holds are the first attempt's: the
+                            // retry is reframed onto them (see rewriteRetryIds).
+                            if (type === "response.created" && resp && resp["id"] !== undefined) heldResponseId = resp["id"];
+                            if (type === "response.output_item.added") {
+                                const added = ev["item"] as Record<string, unknown> | undefined;
+                                if (added && added["id"] !== undefined) heldItemId = added["id"];
+                                if (ev["output_index"] !== undefined) heldOutputIndex = ev["output_index"];
+                            }
+                        }
                     }
-                    if (
-                        type === "response.output_text.done" ||
-                        type === "response.content_part.done" ||
-                        type === "response.output_item.done" ||
-                        type === "response.completed" ||
-                        type === "response.failed" ||
-                        type === "response.incomplete"
-                    ) {
-                        if (type === "response.completed" || type === "response.failed" || type === "response.incomplete") sawTerminal = true;
+                    if (retryFraming(type)) continue;
+                    if (type === "response.output_text.done" || type === "response.content_part.done" || type === "response.output_item.done") {
+                        // HELD until the completion event decides the turn (see
+                        // retryEmptyTurn): releasing it earlier would hand the
+                        // client the echo's own text exactly when the retry is
+                        // about to replace it.
+                        let evOut = ev;
+                        let rebuild = containsRenderTagText(jsonStr) || containsMarkerLineText(jsonStr) || retryRewritePending();
+                        if (rebuild) evOut = stripResponsesText(ev);
+                        rewriteRetryIds(evOut);
+                        heldVisibleChars += responsesEventTextLength(evOut);
+                        heldEvents.push(rebuild ? rebuildEvent(rawEvent, evOut) : rawEvent + "\n\n");
+                        continue;
+                    }
+                    if (type === "response.completed" || type === "response.failed" || type === "response.incomplete") {
+                        sawTerminal = true;
+                        if (await retryEmptyTurn(type === "response.completed" ? "completed" : undefined)) {
+                            // The retry took over: this attempt's held family and
+                            // its own completion frame are dropped together.
+                            heldEvents = [];
+                            heldVisibleChars = 0;
+                            continue;
+                        }
+                        const tailFrame = flushTail("");
+                        if (tailFrame.length > 0) await write(tailFrame);
+                        for (const held of heldEvents) await write(held);
+                        heldEvents = [];
+                        heldVisibleChars = 0;
                         // done-family events also carry full text payloads — strip those too.
                         let evOut = ev;
-                        let rebuild = containsRenderTagText(jsonStr) || containsMarkerLineText(jsonStr);
+                        let rebuild = containsRenderTagText(jsonStr) || containsMarkerLineText(jsonStr) || retryRewritePending();
                         if (rebuild) evOut = stripResponsesText(ev);
-                        const out = rebuild ? rebuildEvent(rawEvent, evOut) : rawEvent + "\n\n";
-                        await write(flushTail(out));
+                        rewriteRetryIds(evOut);
+                        await write(rebuild ? rebuildEvent(rawEvent, evOut) : rawEvent + "\n\n");
                         continue;
                     }
                     if (type === "response.output_text.delta" && typeof ev["delta"] === "string") {
@@ -1344,18 +1486,25 @@ export async function pipePluginResponsesWithStrip(
                             await write(rawEvent + "\n\n");
                             continue;
                         }
-                        if (!mayStartRenderTag(delta) && !mayStartMarkerLine(delta) && !tagFilter.pending()) {
+                        if (!retryRewritePending() && !mayStartRenderTag(delta) && !mayStartMarkerLine(delta) && !tagFilter.pending()) {
                             await write(rawEvent + "\n\n");
                             continue;
                         }
                         const clean = tagFilter.push(delta);
                         lastDeltaMeta = { item_id: ev["item_id"], output_index: ev["output_index"] };
+                        if (!inRetry && heldItemId === undefined && ev["item_id"] !== undefined) {
+                            heldItemId = ev["item_id"];
+                            heldOutputIndex = ev["output_index"];
+                        }
                         if (clean.length === 0) continue;
-                        if (clean === delta) {
+                        visibleTextChars += clean.length;
+                        if (clean === delta && !retryRewritePending()) {
                             await write(rawEvent + "\n\n");
                             continue;
                         }
-                        await write(rebuildEvent(rawEvent, { ...ev, delta: clean }));
+                        const rebuilt = { ...ev, delta: clean };
+                        rewriteRetryIds(rebuilt);
+                        await write(rebuildEvent(rawEvent, rebuilt));
                         continue;
                     }
                     await write(rawEvent + "\n\n");

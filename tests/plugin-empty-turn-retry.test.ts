@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { pipePluginChatWithStrip } from "../src/plugin.ts";
+import { pipePluginChatWithStrip, pipePluginResponsesWithStrip } from "../src/plugin.ts";
 import { setLogCapture } from "../src/logger.ts";
 import { DEGENERATE_RETRY_NUDGE, injectContinuationNudge } from "../src/degenerate-retry.ts";
 import type { Session } from "../src/session.ts";
@@ -255,4 +255,127 @@ test("the continuation retry body carries the nudge as a trailing user turn", ()
 
     assert.equal(injectContinuationNudge("openai", JSON.stringify({ foo: 1 })), null, "unusable body is reported, not mangled");
     assert.equal(injectContinuationNudge("openai", "{not json"), null);
+});
+
+// The Responses pipe carries the same defect for omp's codex subagent turns,
+// but its terminal is a FAMILY (output_text.done, content_part.done,
+// output_item.done) decided by response.completed, and every event carries ids
+// the client already holds. So the retry holds that family until the completion
+// decides, and reframes the retry onto those ids: the client sees one turn.
+function responsesEchoOnlyTurn(): string[] {
+    return [
+        sse("response.created", { type: "response.created", response: { id: "resp_1", status: "in_progress" } }),
+        sse("response.output_item.added", { type: "response.output_item.added", output_index: 0, item: { id: "item_1", type: "message", content: [] } }),
+        sse("response.content_part.added", { type: "response.content_part.added", item_id: "item_1", output_index: 0, part: { type: "output_text", text: "" } }),
+        sse("response.output_text.delta", { type: "response.output_text.delta", item_id: "item_1", output_index: 0, delta: `${TAG_OPEN}m00155${TAG_CLOSE}` }),
+        sse("response.output_text.done", { type: "response.output_text.done", item_id: "item_1", output_index: 0, text: `${TAG_OPEN}m00155${TAG_CLOSE}` }),
+        sse("response.completed", {
+            type: "response.completed",
+            response: {
+                id: "resp_1",
+                status: "completed",
+                output: [{ id: "item_1", type: "message", content: [{ type: "output_text", text: `${TAG_OPEN}m00155${TAG_CLOSE}` }] }],
+            },
+        }),
+    ];
+}
+
+function responsesProseTurn(text: string, responseId = "resp_2", itemId = "item_2", status = "completed"): string[] {
+    return [
+        sse("response.created", { type: "response.created", response: { id: responseId, status: "in_progress" } }),
+        sse("response.output_item.added", { type: "response.output_item.added", output_index: 0, item: { id: itemId, type: "message", content: [] } }),
+        sse("response.content_part.added", { type: "response.content_part.added", item_id: itemId, output_index: 0, part: { type: "output_text", text: "" } }),
+        sse("response.output_text.delta", { type: "response.output_text.delta", item_id: itemId, output_index: 0, delta: text }),
+        sse("response.output_text.done", { type: "response.output_text.done", item_id: itemId, output_index: 0, text }),
+        sse(status === "completed" ? "response.completed" : "response.failed", {
+            type: status === "completed" ? "response.completed" : "response.failed",
+            response: { id: responseId, status, output: [{ id: itemId, type: "message", content: [{ type: "output_text", text }] }] },
+        }),
+    ];
+}
+
+function responsesDeltas(raw: string): string {
+    return [...raw.matchAll(/"delta":"((?:[^"\\]|\\.)*)"/g)].map((m) => JSON.parse(`"${m[1]}"`) as string).join("");
+}
+
+test("plugin responses retries once when the turn's only text was a stripped echo", async () => {
+    const out: string[] = [];
+    let calls = 0;
+    const refetch = () => {
+        calls += 1;
+        return Promise.resolve(streamOf(responsesProseTurn("recovered after the nudge")));
+    };
+    await pipePluginResponsesWithStrip(streamOf(responsesEchoOnlyTurn()), makeRes(out), makeSession(), undefined, refetch);
+    const text = out.join("");
+    assert.equal(calls, 1, "exactly one re-issue");
+    assert.equal(responsesDeltas(text), "recovered after the nudge", "the retry's prose is what the client assembles");
+    assert.equal((text.match(/"type":"response\.created"/g) ?? []).length, 1, "the retry does not open a second response");
+    assert.equal((text.match(/"type":"response\.completed"/g) ?? []).length, 1, "one turn, one terminal");
+    assert.equal((text.match(/"type":"response\.output_item\.added"/g) ?? []).length, 1, "the retry's own added events are dropped");
+    assert.ok(!text.includes("m00155"), "the echoed tag never leaks");
+    assert.ok(!text.includes("item_2") && !text.includes("resp_2"), `the retry's ids are rewritten onto the client's, got: ${text}`);
+    assert.ok(text.includes('"item_id":"item_1"'), "the retry's deltas carry the item id the client already holds");
+});
+
+test("plugin responses releases the held done-family events on a healthy turn", async () => {
+    const out: string[] = [];
+    let calls = 0;
+    const refetch = () => {
+        calls += 1;
+        return Promise.resolve(streamOf(responsesProseTurn("unwanted")));
+    };
+    await pipePluginResponsesWithStrip(streamOf(responsesProseTurn("the model answered")), makeRes(out), makeSession(), undefined, refetch);
+    const text = out.join("");
+    assert.equal(calls, 0, "no re-issue when the turn was not empty");
+    assert.equal(responsesDeltas(text), "the model answered");
+    const done = text.indexOf('"type":"response.output_text.done"');
+    const completed = text.indexOf('"type":"response.completed"');
+    assert.ok(done >= 0 && completed > done, `holding must not reorder the turn, got: ${text}`);
+});
+
+test("plugin responses does not retry a completed turn whose text arrives only in the done event", async () => {
+    const out: string[] = [];
+    let calls = 0;
+    const refetch = () => {
+        calls += 1;
+        return Promise.resolve(streamOf(responsesProseTurn("unwanted")));
+    };
+    const events = responsesProseTurn("the whole answer off-stream", "resp_3", "item_3").filter((e) => !e.includes("response.output_text.delta"));
+    await pipePluginResponsesWithStrip(streamOf(events), makeRes(out), makeSession(), undefined, refetch);
+    assert.equal(calls, 0, "text the client would receive from the done event is not an empty turn");
+});
+
+test("plugin responses does not retry a turn that produced a function call", async () => {
+    const out: string[] = [];
+    let calls = 0;
+    const refetch = () => {
+        calls += 1;
+        return Promise.resolve(streamOf(responsesProseTurn("unwanted")));
+    };
+    const events = [
+        sse("response.created", { type: "response.created", response: { id: "resp_1", status: "in_progress" } }),
+        sse("response.output_item.added", { type: "response.output_item.added", output_index: 0, item: { id: "item_1", type: "function_call", name: "read" } }),
+        sse("response.output_text.delta", { type: "response.output_text.delta", item_id: "item_1", output_index: 0, delta: `${TAG_OPEN}m00155${TAG_CLOSE}` }),
+        sse("response.completed", { type: "response.completed", response: { id: "resp_1", status: "completed", output: [{ id: "item_1", type: "function_call" }] } }),
+    ];
+    await pipePluginResponsesWithStrip(streamOf(events), makeRes(out), makeSession(), undefined, refetch);
+    assert.equal(calls, 0, "a tool call is not an empty turn");
+    assert.ok(out.join("").includes('"function_call"'), "the agent's own tool surface still passes through");
+});
+
+test("plugin responses does not retry a turn the provider failed or cut", async () => {
+    const out: string[] = [];
+    let calls = 0;
+    const refetch = () => {
+        calls += 1;
+        return Promise.resolve(streamOf(responsesProseTurn("unwanted")));
+    };
+    await pipePluginResponsesWithStrip(
+        streamOf(responsesProseTurn(`${TAG_OPEN}m00155${TAG_CLOSE}`, "resp_4", "item_4", "failed")),
+        makeRes(out),
+        makeSession(),
+        undefined,
+        refetch,
+    );
+    assert.equal(calls, 0, "a failed turn is a real terminal, not an empty one");
 });
