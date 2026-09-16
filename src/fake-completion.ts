@@ -1,5 +1,6 @@
 import type { WireProtocol } from "./util.js";
 import { containsToolCallXmlFragment } from "./loop/tag-echo-filter.js";
+import { appendTrailingUserText } from "./wire-body.js";
 
 // #371 (root-cause follow-up to #361): a small model can WRITE a tool call as
 // plain text (echoing the tool-call XML template from the context) instead of
@@ -82,43 +83,9 @@ export function isFakeCompletion(protocol: WireProtocol, rawText: string): boole
     return hasToolCallStructure(rawText) && !hasToolBlock(protocol, rawText);
 }
 
-// Appends the hint as a trailing user message, merged into the last user
-// message when present (avoids back-to-back user turns on strict providers).
-// Returns the hinted JSON, or null if the body is unparseable (skip the retry).
+/** Append the fake-completion hint to the request body as a trailing user turn
+ *  (per-wire shapes live in `appendTrailingUserText`). Returns the hinted JSON,
+ *  or null if the body is unparseable, in which case the retry is skipped. */
 export function injectFakeCompletionHint(protocol: WireProtocol, body: string | Buffer): string | null {
-    const raw = typeof body === "string" ? body : body.toString("utf8");
-    let obj: Record<string, unknown>;
-    try {
-        obj = JSON.parse(raw) as Record<string, unknown>;
-    } catch {
-        return null;
-    }
-    if (protocol === "responses") {
-        const input = obj.input;
-        if (!Array.isArray(input)) return null;
-        const arr = input as Record<string, unknown>[];
-        const last = arr[arr.length - 1];
-        if (last && typeof last === "object" && last.role === "user") {
-            const c = last.content;
-            if (typeof c === "string") last.content = `${c}\n\n${FAKE_COMPLETION_HINT}`;
-            else if (Array.isArray(c)) last.content = [...c, { type: "input_text", text: FAKE_COMPLETION_HINT }];
-            else last.content = FAKE_COMPLETION_HINT;
-        } else {
-            arr.push({ role: "user", content: [{ type: "input_text", text: FAKE_COMPLETION_HINT }] });
-        }
-        return JSON.stringify(obj);
-    }
-    const messages = obj.messages;
-    if (!Array.isArray(messages)) return null;
-    const arr = messages as Record<string, unknown>[];
-    const last = arr[arr.length - 1];
-    if (last && typeof last === "object" && last.role === "user") {
-        const c = last.content;
-        if (typeof c === "string") last.content = `${c}\n\n${FAKE_COMPLETION_HINT}`;
-        else if (Array.isArray(c)) last.content = [...c, { type: "text", text: FAKE_COMPLETION_HINT }];
-        else last.content = FAKE_COMPLETION_HINT;
-    } else {
-        arr.push({ role: "user", content: FAKE_COMPLETION_HINT });
-    }
-    return JSON.stringify(obj);
+    return appendTrailingUserText(protocol, body, FAKE_COMPLETION_HINT);
 }

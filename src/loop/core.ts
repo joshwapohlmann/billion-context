@@ -23,14 +23,9 @@ import { dumpRejectedBody } from "../error-dump.js";
 import { isStrictReasoningEcho, normalizeStrictEchoBody } from "../strict-echo.js";
 import { log as loggerLog } from "../logger.js";
 import { promptInputTotal, type WireProtocol } from "../util.js";
+import { DEGENERATE_RETRY_NUDGE } from "../degenerate-retry.js";
 
 export const MAX_LOOP_ROUNDS = 10;
-
-// #732: ephemeral continuation prompt appended ONLY to the degenerate-turn
-// retry body — never committed to coreMessages/session state, so it is neither
-// persisted nor replayed on the client's next (client-authored) request.
-const DEGENERATE_RETRY_NUDGE =
-    "[billion-context] Your previous response ended with no visible text and no tool call. Continue now: take your next concrete action.";
 
 function isLoopThinking(m: CoreMessage): boolean {
     return m.contentType === "reasoning" && typeof m.id === "string" && m.id.startsWith("acp_loop_");

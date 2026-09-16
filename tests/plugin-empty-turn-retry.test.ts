@@ -1,0 +1,258 @@
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { pipePluginChatWithStrip } from "../src/plugin.ts";
+import { setLogCapture } from "../src/logger.ts";
+import { DEGENERATE_RETRY_NUDGE, injectContinuationNudge } from "../src/degenerate-retry.ts";
+import type { Session } from "../src/session.ts";
+
+// The plugin pipe is what serves plugin-mode agents (this machine's omp
+// sessions among them). A turn whose ONLY text is an echoed render tag is
+// emptied by the tag filter, so the host receives a completed turn with no text
+// and no tool call and aborts it — the #732/#821 retry, which the compress loop
+// already ships for its own request path, is re-issued here on the agent's own
+// body. These tests pin the pipe half of that contract.
+
+function makeSession(): Session {
+    return {
+        id: "testsess",
+        protocol: "openai",
+        upstreamOrigin: "http://127.0.0.1:9/v1",
+        label: "test",
+        createdAt: 0,
+        lastUsedAt: 0,
+        requests: 0,
+        lastInputTokens: 0,
+        stats: {},
+        dirty: false,
+    } as unknown as Session;
+}
+
+function makeRes(chunks: string[]) {
+    return {
+        writes: chunks,
+        write(b: Buffer | string) {
+            chunks.push(typeof b === "string" ? b : b.toString("utf8"));
+            return true;
+        },
+        end(b?: Buffer | string) {
+            if (b !== undefined) chunks.push(typeof b === "string" ? b : b.toString("utf8"));
+        },
+        once() {},
+        destroyed: false,
+        writableEnded: false,
+    } as unknown as import("node:http").ServerResponse;
+}
+
+function streamOf(events: string[]): ReadableStream<Uint8Array> {
+    const enc = new TextEncoder();
+    let i = 0;
+    return new ReadableStream<Uint8Array>({
+        pull(controller) {
+            if (i < events.length) {
+                controller.enqueue(enc.encode(events[i]));
+                i += 1;
+            } else {
+                controller.close();
+            }
+        },
+    });
+}
+
+const TAG_OPEN = "\x3cacp tokens=\"247\" type=\"text\"\x3e";
+const TAG_CLOSE = "\x3c/acp\x3e";
+
+function chatChunk(delta: Record<string, unknown>, extra: Record<string, unknown> = {}): string {
+    return `data: ${JSON.stringify({ id: "chatcmpl-1", object: "chat.completion.chunk", created: 1, model: "qwen", choices: [{ index: 0, delta, finish_reason: null }], ...extra })}\n\n`;
+}
+
+const DONE = "data: [DONE]\n\n";
+
+function chatStop(reason = "stop"): string {
+    return `data: ${JSON.stringify({ id: "chatcmpl-1", object: "chat.completion.chunk", created: 1, model: "qwen", choices: [{ index: 0, delta: {}, finish_reason: reason }] })}\n\n`;
+}
+
+/** The failing turn in production: the model imitates the render tag it saw in
+ *  its prompt and emits nothing else, so the filter empties the whole turn. */
+function echoOnlyTurn(): string[] {
+    return [chatChunk({ role: "assistant" }), chatChunk({ content: `${TAG_OPEN}m00155${TAG_CLOSE}` }), chatStop(), DONE];
+}
+
+function proseTurn(text: string): string[] {
+    return [chatChunk({ role: "assistant" }), chatChunk({ content: text }), chatStop(), DONE];
+}
+
+const sse = (event: string, data: unknown): string => `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+
+function anthropicEchoOnlyTurn(): string[] {
+    return [
+        sse("message_start", { type: "message_start", message: { id: "msg_1", role: "assistant", usage: { input_tokens: 40 } } }),
+        sse("content_block_start", { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } }),
+        sse("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: `${TAG_OPEN}m00155${TAG_CLOSE}` } }),
+        sse("content_block_stop", { type: "content_block_stop", index: 0 }),
+        sse("message_delta", { type: "message_delta", delta: { stop_reason: "end_turn", stop_sequence: null }, usage: { output_tokens: 3 } }),
+        sse("message_stop", { type: "message_stop" }),
+    ];
+}
+
+function anthropicProseTurn(text: string): string[] {
+    return [
+        sse("message_start", { type: "message_start", message: { id: "msg_2", role: "assistant", usage: { input_tokens: 40 } } }),
+        sse("content_block_start", { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } }),
+        sse("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text } }),
+        sse("content_block_stop", { type: "content_block_stop", index: 0 }),
+        sse("message_delta", { type: "message_delta", delta: { stop_reason: "end_turn", stop_sequence: null }, usage: { output_tokens: 9 } }),
+        sse("message_stop", { type: "message_stop" }),
+    ];
+}
+
+function textDeltas(raw: string, protocol: "openai" | "anthropic"): string {
+    const re =
+        protocol === "anthropic" ? /"type":"text_delta","text":"((?:[^"\\]|\\.)*)"/g : /"content":"((?:[^"\\]|\\.)*)"/g;
+    return [...raw.matchAll(re)].map((m) => JSON.parse(`"${m[1]}"`) as string).join("");
+}
+
+test("plugin chat retries once when the turn's only text was a stripped render-tag echo", async () => {
+    const out: string[] = [];
+    const res = makeRes(out);
+    let calls = 0;
+    const refetch = () => {
+        calls += 1;
+        return Promise.resolve(streamOf(proseTurn("real answer after the nudge")));
+    };
+    await pipePluginChatWithStrip(streamOf(echoOnlyTurn()), res, "openai", makeSession(), undefined, refetch);
+    const text = out.join("");
+    assert.equal(calls, 1, "exactly one re-issue");
+    assert.equal(textDeltas(text, "openai"), "real answer after the nudge", "the retry's content reaches the client");
+    assert.equal((text.match(/\[DONE\]/g) ?? []).length, 1, "one turn, one terminal");
+    assert.ok(!text.includes("m00155"), "the echoed tag never leaks");
+    assert.equal((text.match(/"finish_reason":"stop"/g) ?? []).length, 1, "the first attempt's terminal is dropped, not doubled");
+});
+
+test("plugin chat does not retry a turn that already delivered visible text", async () => {
+    const out: string[] = [];
+    let calls = 0;
+    const refetch = () => {
+        calls += 1;
+        return Promise.resolve(streamOf(proseTurn("unwanted")));
+    };
+    await pipePluginChatWithStrip(streamOf(proseTurn("the model answered")), makeRes(out), "openai", makeSession(), undefined, refetch);
+    assert.equal(calls, 0, "no re-issue when the turn was not empty");
+    assert.equal(textDeltas(out.join(""), "openai"), "the model answered");
+});
+
+test("plugin chat does not retry a turn that produced a tool call", async () => {
+    const out: string[] = [];
+    let calls = 0;
+    const refetch = () => {
+        calls += 1;
+        return Promise.resolve(streamOf(proseTurn("unwanted")));
+    };
+    const events = [
+        chatChunk({ role: "assistant" }),
+        chatChunk({ content: `${TAG_OPEN}m00155${TAG_CLOSE}` }),
+        `data: ${JSON.stringify({ id: "chatcmpl-1", object: "chat.completion.chunk", created: 1, model: "qwen", choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: "call_1", type: "function", function: { name: "compress", arguments: "{}" } }] }, finish_reason: null }] })}\n\n`,
+        chatStop("tool_calls"),
+        DONE,
+    ];
+    await pipePluginChatWithStrip(streamOf(events), makeRes(out), "openai", makeSession(), undefined, refetch);
+    assert.equal(calls, 0, "a tool call is not an empty turn");
+    assert.ok(out.join("").includes("compress"), "the agent's own tool call still passes through");
+});
+
+test("plugin chat does not retry a turn the provider ended on a non-clean reason", async () => {
+    const out: string[] = [];
+    let calls = 0;
+    const refetch = () => {
+        calls += 1;
+        return Promise.resolve(streamOf(proseTurn("unwanted")));
+    };
+    const events = [chatChunk({ role: "assistant" }), chatChunk({ content: `${TAG_OPEN}m00155${TAG_CLOSE}` }), chatStop("content_filter"), DONE];
+    await pipePluginChatWithStrip(streamOf(events), makeRes(out), "openai", makeSession(), undefined, refetch);
+    assert.equal(calls, 0, "a filtered turn must not be re-prompted");
+});
+
+test("plugin chat passes the empty turn through and warns when the retry is empty too", async () => {
+    const out: string[] = [];
+    const logs: string[] = [];
+    setLogCapture((_level, msg) => {
+        logs.push(msg);
+    });
+    let calls = 0;
+    const refetch = () => {
+        calls += 1;
+        return Promise.resolve(streamOf([DONE]));
+    };
+    try {
+        await pipePluginChatWithStrip(streamOf(echoOnlyTurn()), makeRes(out), "openai", makeSession(), undefined, refetch);
+    } finally {
+        setLogCapture(null);
+    }
+    const text = out.join("");
+    assert.equal(calls, 1, "one attempt only");
+    assert.equal((text.match(/\[DONE\]/g) ?? []).length, 1, "the retry's own terminal closes the turn");
+    assert.ok(
+        logs.some((l) => l.includes("degenerate")),
+        `a still-empty turn stays visible to the operator, got: ${JSON.stringify(logs)}`,
+    );
+});
+
+test("plugin chat passes the empty turn through when the retry cannot be issued", async () => {
+    const out: string[] = [];
+    const logs: string[] = [];
+    setLogCapture((_level, msg) => {
+        logs.push(msg);
+    });
+    try {
+        await pipePluginChatWithStrip(streamOf(echoOnlyTurn()), makeRes(out), "openai", makeSession(), undefined, () => Promise.resolve(null));
+    } finally {
+        setLogCapture(null);
+    }
+    const text = out.join("");
+    assert.equal((text.match(/\[DONE\]/g) ?? []).length, 1, "the original terminal is presented unchanged");
+    const dataLines = text.split("\n").filter((l) => l.startsWith("data:")).filter((l) => !l.includes("[DONE]"));
+    for (const l of dataLines) {
+        assert.doesNotThrow(() => JSON.parse(l.slice(5).trim()), "every data line stays valid JSON");
+    }
+});
+
+test("plugin chat (anthropic) lands the retry's content in a block after the client's own", async () => {
+    const out: string[] = [];
+    let calls = 0;
+    const refetch = () => {
+        calls += 1;
+        return Promise.resolve(streamOf(anthropicProseTurn("the continuation")));
+    };
+    await pipePluginChatWithStrip(streamOf(anthropicEchoOnlyTurn()), makeRes(out), "anthropic", makeSession(), undefined, refetch);
+    const text = out.join("");
+    assert.equal(calls, 1);
+    assert.equal((text.match(/"type":"message_start"/g) ?? []).length, 1, "the retry must not re-open the message");
+    assert.equal((text.match(/"type":"message_stop"/g) ?? []).length, 1, "one turn, one terminal");
+    assert.equal(textDeltas(text, "anthropic"), "the continuation");
+    assert.ok(text.includes('"index":1'), `the retry's block follows the client's closed block 0, got: ${text}`);
+});
+
+test("the continuation retry body carries the nudge as a trailing user turn", () => {
+    const openaiBody = JSON.stringify({ model: "m", messages: [{ role: "user", content: "hi" }] });
+    const merged = JSON.parse(injectContinuationNudge("openai", openaiBody)!) as { messages: { role: string; content: string }[] };
+    assert.equal(merged.messages.length, 1, "merged into the existing user turn instead of adding a second one");
+    assert.equal(merged.messages[0]!.role, "user");
+    assert.ok(merged.messages[0]!.content.startsWith("hi"), "the original text is preserved");
+    assert.ok(
+        merged.messages[0]!.content.includes("ended with no visible text and no tool call"),
+        `the nudge text is appended, got: ${merged.messages[0]!.content}`,
+    );
+
+    const anthropicBody = JSON.stringify({ messages: [{ role: "user", content: [{ type: "text", text: "hi" }] }] });
+    const asBlock = JSON.parse(injectContinuationNudge("anthropic", anthropicBody)!) as {
+        messages: { content: { type: string; text: string }[] }[];
+    };
+    assert.equal(asBlock.messages[0]!.content.length, 2, "anthropic content is a block array");
+    assert.equal(asBlock.messages[0]!.content[1]!.text, DEGENERATE_RETRY_NUDGE);
+
+    const assistantLast = JSON.stringify({ messages: [{ role: "assistant", content: "done" }] });
+    const appended = JSON.parse(injectContinuationNudge("openai", assistantLast)!) as { messages: { role: string }[] };
+    assert.equal(appended.messages.length, 2, "a body ending on the assistant side gets a fresh user turn");
+
+    assert.equal(injectContinuationNudge("openai", JSON.stringify({ foo: 1 })), null, "unusable body is reported, not mangled");
+    assert.equal(injectContinuationNudge("openai", "{not json"), null);
+});
