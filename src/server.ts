@@ -1,5 +1,6 @@
 import http from "node:http";
 import fs from "node:fs";
+import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { createCore, type CompressionCore, type CompressionState, type Config, type CoreMessage, type NudgeDecision, type Prompts, type PackSurface, type ToolPrompts, applyAcpToolOverrides, defaultPrompts, defaultCountTokens, estimateTokensFast, renderNudgeText, deactivateBlock, viableRanges } from "acp-kernel";
 import { resolveCompress, resolveCompressPrompts, resolveCompressSurfaceDetailed, resolveRequestConfig } from "./compress-settings.js";
@@ -65,7 +66,7 @@ import { renderUI, handleConfigGet, handleConfigPut } from "./web/index.js";
 import { reapOrphanBlocks } from "./orphan-gc.js";
 import { getStore } from "./persist.js";
 import { log as loggerLog, configureLogger, getLogPath, closeLogger } from "./logger.js";
-import { configFile, defaultLogFile, stateDir } from "./paths.js";
+import { configFile, defaultLogFile, dumpsDir, stateDir } from "./paths.js";
 import { atomicWriteInstanceFile, clearProxyInstanceFile, isPidAlive, registerInstanceAndWarn, unregisterInstance } from "./instance.js";
 import { compressLoopResponsesJson } from "./compress-loop-responses.js";
 import { hoistTrappedToolItems } from "./tool-pair-order.js";
@@ -968,13 +969,13 @@ async function handle(
     }
     if (bodyDumpEnabled() && parsed && typeof parsed === "object") {
         try {
-            const rawDir = process.env.ACP_RAW_DUMP_DIR || `${stateDir()}/raw`;
+            const rawDir = process.env.ACP_RAW_DUMP_DIR || path.join(stateDir(), "raw");
             try { fs.mkdirSync(rawDir, { recursive: true }); } catch { /* best-effort */ }
             const hdrs = maskHeadersForLog(
                 Object.fromEntries(Object.entries(req.headers).map(([k, v]) => [k, Array.isArray(v) ? v.join(",") : String(v)])),
             );
             const hdrText = Object.entries(hdrs).map(([k, v]) => `${k}: ${v}`).join("\n");
-            fs.writeFileSync(`${rawDir}/${Date.now()}-INCOMING.txt`, `${req.method} ${maskUrlsInText(req.url ?? "")}\n${hdrText}\n\n${bodyBuffer.toString("utf8")}`);
+            fs.writeFileSync(path.join(rawDir, `${Date.now()}-INCOMING.txt`), `${req.method} ${maskUrlsInText(req.url ?? "")}\n${hdrText}\n\n${bodyBuffer.toString("utf8")}`);
         } catch (err) { logDumpFailure("INCOMING dump", err); }
     }
     // Per-request context limit + compression tuning: look up body.model against
@@ -3455,10 +3456,10 @@ async function forward(
                 log("info", `[debug] tools=[${toolNames.join(",")}] msgs=${parsed.messages?.length ?? 0} stream=${parsed.stream ?? false} system_len=${JSON.stringify(parsed.messages?.find((m: Record<string, string>) => m.role === "system")?.content ?? "").length}`);
             }
             if (bodyDumpEnabled() && process.env.ACP_DUMP_REQ !== "0") {
-                const dumpDir = process.env.ACP_DUMP_DIR || `${stateDir()}/dumps`;
+                const dumpDir = dumpsDir();
                 try { fs.mkdirSync(dumpDir, { recursive: true }); } catch { /* best-effort */ }
                 const sid = prepared?.session.id ?? "unknown";
-                const out = `${dumpDir}/req-${Date.now()}-${safeSessionId(sid)}.json`;
+                const out = path.join(dumpDir, `req-${Date.now()}-${safeSessionId(sid)}.json`);
                 try {
                     const pretty = JSON.stringify(JSON.parse(wireBody), null, 2);
                     fs.writeFileSync(out, pretty);
@@ -3488,9 +3489,9 @@ async function forward(
         bodyDumpEnabled()
             ? (() => {
                   try {
-                      const rawDir = process.env.ACP_RAW_DUMP_DIR || `${stateDir()}/raw`;
+                      const rawDir = process.env.ACP_RAW_DUMP_DIR || path.join(stateDir(), "raw");
                       fs.mkdirSync(rawDir, { recursive: true });
-                      return `${rawDir}/${Date.now()}-${safeSessionId(prepared?.session.id)}`;
+                      return path.join(rawDir, `${Date.now()}-${safeSessionId(prepared?.session.id)}`);
                   } catch {
                       return "";
                   }

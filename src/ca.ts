@@ -10,17 +10,20 @@ const COMBINED_CA_FILE = "combined-ca.pem";
 const ROOT_CN = "billion-context MITM Root CA";
 
 /** First readable candidate wins per platform; Node's Mozilla root set is
- *  always merged in so the combined bundle also works on Windows. */
+ *  always merged in, which is ALSO the only root source on Windows (no
+ *  filesystem bundle to probe — no XDG on win32). */
 const PLATFORM_CA_CANDIDATES: readonly string[] =
     process.platform === "darwin"
         ? ["/etc/ssl/cert.pem", "/private/etc/ssl/cert.pem"]
-        : [
-              "/etc/ssl/certs/ca-certificates.crt",
-              "/etc/pki/tls/certs/ca-bundle.crt",
-              "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",
-              "/etc/ssl/ca-bundle.pem",
-              "/etc/ssl/cert.pem",
-          ];
+        : process.platform === "win32"
+          ? []
+          : [
+                "/etc/ssl/certs/ca-certificates.crt",
+                "/etc/pki/tls/certs/ca-bundle.crt",
+                "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",
+                "/etc/ssl/ca-bundle.pem",
+                "/etc/ssl/cert.pem",
+            ];
 
 let rootCertPem: string | undefined;
 let rootKeyPem: string | undefined;

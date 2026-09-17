@@ -324,7 +324,8 @@ test("e2e #781 (OpenAI): image-bearing messages render placeholders in the summa
         req.on("end", () => {
             const raw = Buffer.concat(chunks).toString("utf8");
             const parsed = JSON.parse(raw) as { max_tokens?: number };
-            if (parsed.max_tokens === 8192) {
+            // #853: summary calls are detected by the raised 32k output cap.
+            if (parsed.max_tokens === 32768) {
                 summaryBodies.push(JSON.parse(raw));
                 res.writeHead(200, { "content-type": "application/json" });
                 res.end(JSON.stringify({ choices: [{ message: { role: "assistant", content: SUMMARY_TEXT } }] }));

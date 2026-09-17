@@ -247,7 +247,7 @@ test("#857 C: usage-grounded over-window baseline — hatch stays closed AND the
 test("#857 D: upward self-heal trusts usage baselines only (estimate blocked, usage confirmed)", async () => {
     const { server: upstream, port: uport } = await startMockUpstream();
     // No route model entry: "deepseek-flash" resolves via CONTEXT_LIMIT_TABLE
-    // (/^deepseek/i → 128k) — a fallback source, so nativeFromFallback=true.
+    // (/^deepseek/i → 1M since #852) — a fallback source, so nativeFromFallback=true.
     const { proxy, port } = await startProxy(uport, {}, 200_000);
     try {
         const url = `http://127.0.0.1:${port}/bili/http://127.0.0.1:${uport}/v1/responses`;
@@ -258,7 +258,7 @@ test("#857 D: upward self-heal trusts usage baselines only (estimate blocked, us
         await r1.text();
 
         let s = sess("s857d");
-        s.stats.lastInputTokens = 140_000;
+        s.stats.lastInputTokens = 1_100_000;
         s.stats.lastInputTokensSource = "estimate";
         const r2 = await fetch(url, { method: "POST", headers, body: body(MODEL, "s857d", [{ type: "message", role: "user", content: "second turn" }]) });
         assert.equal(r2.status, 200);
@@ -267,13 +267,13 @@ test("#857 D: upward self-heal trusts usage baselines only (estimate blocked, us
         assert.equal(confirmedOf("s857d"), undefined, "an estimate-derived baseline must not confirm a window");
 
         // Turn 2's successful usage report reset the baseline — re-stamp it.
-        s.stats.lastInputTokens = 140_000;
+        s.stats.lastInputTokens = 1_100_000;
         s.stats.lastInputTokensSource = "usage";
         const r3 = await fetch(url, { method: "POST", headers, body: body(MODEL, "s857d", [{ type: "message", role: "user", content: "third turn" }]) });
         assert.equal(r3.status, 200);
         await r3.text();
         s = sess("s857d");
-        assert.deepEqual(confirmedOf("s857d"), { [MODEL]: 140_000 }, "a usage-derived baseline confirms the window");
+        assert.deepEqual(confirmedOf("s857d"), { [MODEL]: 1_100_000 }, "a usage-derived baseline confirms the window");
     } finally {
         upstream.close();
         proxy.close();

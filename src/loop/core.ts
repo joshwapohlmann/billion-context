@@ -20,6 +20,7 @@ import { proxyDispatcher } from "../upstream-proxy.js";
 import { noteWeakOverflow } from "../weak-overflow.js";
 import { warnCacheCollapse } from "../cache-warn.js";
 import { dumpRejectedBody } from "../error-dump.js";
+import { dumpsDir } from "../paths.js";
 import { isStrictReasoningEcho, normalizeStrictEchoBody } from "../strict-echo.js";
 import { log as loggerLog } from "../logger.js";
 import { promptInputTotal, type WireProtocol } from "../util.js";
@@ -692,10 +693,11 @@ export async function* runCompressLoop(
             if (process.env.ACP_DUMP_BODY === "1") {
                 try {
                     const fs = await import("node:fs");
-                    const dumpDir = process.env.ACP_DUMP_DIR || `${process.env.HOME}/.local/state/billion-context/dumps`;
+                    const path = await import("node:path");
+                    const dumpDir = dumpsDir();
                     fs.mkdirSync(dumpDir, { recursive: true });
-                    const sid = ctx.session.id ?? "unknown";
-                    fs.writeFileSync(`${dumpDir}/req-${Date.now()}-${sid}-REREQUEST.json`, JSON.stringify(newBody, null, 2));
+                    const sid = (ctx.session.id ?? "unknown").replace(/[^a-zA-Z0-9_-]/g, "_");
+                    fs.writeFileSync(path.join(dumpDir, `req-${Date.now()}-${sid}-REREQUEST.json`), JSON.stringify(newBody, null, 2));
                 } catch { /* best-effort */ }
             }
             let respResult: { response: Response; clearTimer: () => void };

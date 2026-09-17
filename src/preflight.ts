@@ -14,6 +14,7 @@ import { applyRanges, type RewriteCtx } from "./stream.js";
 import { fetchWithTimeout, isTransientUpstreamError, replayMaxAttempts, replayBackoffMs, sleep, UpstreamHttpError } from "./fetch-util.js";
 import { proxyDispatcher } from "./upstream-proxy.js";
 import { lastCompressSuffix, type Session } from "./session.js";
+import { peekRegistryOutputLimit } from "./registry.js";
 
 // #247: proactive pre-forward compression. When the session's real context
 // (previous turn's upstream input_tokens) exceeds the current model's window
@@ -29,7 +30,15 @@ const MAX_PREFLIGHT_ROUNDS = 16;
 const CHUNK_FRACTION = 0.6;
 const MIN_CHUNK_TOKENS = 2000;
 const MIN_SUMMARY_CHARS = 50;
-const MAX_SUMMARY_OUTPUT_TOKENS = 8192;
+// #853: thinking-on-by-default models spend the shared output budget on
+// reasoning_content before any answer text (observed ~9.5k reasoning tokens on
+// deepseek-flash, whose real output ceiling is 384k) — the old 8192 cap
+// guaranteed content:"" + finish_reason:"length". 32k leaves ~3x headroom
+// over the observed reasoning while still bounding runaway output.
+// summaryPayload() clamps this per model against known models.dev ceilings
+// (peekRegistryOutputLimit — warm cache first, bundled snapshot floor) so
+// models with a smaller real cap are not over-asked.
+const MAX_SUMMARY_OUTPUT_TOKENS = 32768;
 // #574: bound on upstream summarization calls per invocation — the multi-range
 // walk can otherwise spend a call per viable range in a block-dense history.
 export const MAX_SUMMARY_CALLS_PER_PREFLIGHT = 16;
@@ -247,12 +256,30 @@ function splitChunks(
     return chunks;
 }
 
-function summaryPayload(protocol: PreflightProtocol, model: string, system: string, content: string, stream: boolean, includeMaxOutputTokens: boolean): Record<string, unknown> {
+// #853: the summary max_tokens for a model — the 32k default, clamped down to
+// the model's known output ceiling when models.dev reports a smaller one.
+// Host comes from the upstream URL so a known provider's namespaced entry
+// wins over the cross-provider scan; the registry cache is pre-warmed with
+// the bundled snapshot at module load, so this never fetches or blocks.
+function safeHost(url: string): string | undefined {
+    try {
+        return new URL(url).host;
+    } catch {
+        return undefined;
+    }
+}
+function summaryOutputTokens(model: string, host?: string): number {
+    const known = peekRegistryOutputLimit(model, host);
+    return known === undefined ? MAX_SUMMARY_OUTPUT_TOKENS : Math.min(MAX_SUMMARY_OUTPUT_TOKENS, known);
+}
+
+function summaryPayload(protocol: PreflightProtocol, model: string, system: string, content: string, stream: boolean, includeMaxOutputTokens: boolean, host?: string): Record<string, unknown> {
+    const maxOutputTokens = summaryOutputTokens(model, host);
     if (protocol === "anthropic") {
-        return { model, max_tokens: MAX_SUMMARY_OUTPUT_TOKENS, system, messages: [{ role: "user", content }], stream };
+        return { model, max_tokens: maxOutputTokens, system, messages: [{ role: "user", content }], stream };
     }
     if (protocol === "openai") {
-        return { model, max_tokens: MAX_SUMMARY_OUTPUT_TOKENS, messages: [{ role: "system", content: system }, { role: "user", content }], stream };
+        return { model, max_tokens: maxOutputTokens, messages: [{ role: "system", content: system }, { role: "user", content }], stream };
     }
     if (protocol === "google") {
         // Gemini carries the model in the request PATH (never in the body) and
@@ -270,7 +297,7 @@ function summaryPayload(protocol: PreflightProtocol, model: string, system: stri
     // rejected the parameter (learned per URL+model); the model's default
     // output cap then applies.
     const payload: Record<string, unknown> = { model, instructions: system, input: [{ role: "user", content }], stream, store: false };
-    if (includeMaxOutputTokens) payload.max_output_tokens = MAX_SUMMARY_OUTPUT_TOKENS;
+    if (includeMaxOutputTokens) payload.max_output_tokens = maxOutputTokens;
     return payload;
 }
 
@@ -291,8 +318,8 @@ const MAX_OUTPUT_TOKENS_REJECTED_RE = /\bmax_output_tokens\b/i;
 // #663: per-endpoint learning of the max_output_tokens rejection. Keyed by
 // upstream URL + model (persisted with the session metadata, like #626's
 // stream flag) because the rejection is per-endpoint: a session can switch
-// models mid-conversation, and a model that accepts the limit must keep the
-// 8192 cap.
+// models mid-conversation, and a model that accepts the limit must keep its
+// (model-clamped) summary cap.
 function noMaxOutputTokensKey(deps: PreflightDeps): string {
     return `${deps.url}\u0000${deps.model}`;
 }
@@ -672,7 +699,7 @@ async function requestSummaryBody(deps: PreflightDeps, body: string): Promise<st
 const SSE_DATA_LINE_RE = /(?:^|\n)data:/;
 
 async function requestSummary(deps: PreflightDeps, system: string, content: string, stream: boolean, includeMaxOutputTokens: boolean): Promise<SummaryOutcome> {
-    const text = await requestSummaryBody(deps, JSON.stringify(summaryPayload(deps.protocol, deps.model, system, content, stream, includeMaxOutputTokens)));
+    const text = await requestSummaryBody(deps, JSON.stringify(summaryPayload(deps.protocol, deps.model, system, content, stream, includeMaxOutputTokens, safeHost(deps.url))));
     let json: unknown;
     try {
         json = JSON.parse(text);
