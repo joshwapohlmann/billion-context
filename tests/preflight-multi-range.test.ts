@@ -199,6 +199,7 @@ test("#574 budget cap: many unusable ranges → exactly MAX_SUMMARY_CALLS_PER_PR
         assert.equal(json.error?.code, "preflight_compress_failed");
         assert.equal(json.error?.retryable, false);
         assert.match(json.error?.message ?? "", /summarization budget/i, `the budget variant is reported (got: ${json.error?.message})`);
+        assert.match(json.error?.message ?? "", /compressible range\(s\) still visible/, `reports how many compressible ranges remain (got: ${json.error?.message})`);
 
         const summaryCalls = calls.filter((c) => !c.stream);
         assert.equal(summaryCalls.length, MAX_SUMMARY_CALLS_PER_PREFLIGHT, `the call cap bounds the walk (got ${summaryCalls.length})`);

@@ -26,7 +26,7 @@ import { peekRegistryOutputLimit } from "./registry.js";
 // summarization calls sized to fit the smaller window, before the payload is
 // forwarded.
 
-const MAX_PREFLIGHT_ROUNDS = 16;
+export const MAX_PREFLIGHT_ROUNDS = 16;
 const CHUNK_FRACTION = 0.6;
 const MIN_CHUNK_TOKENS = 2000;
 const MIN_SUMMARY_CHARS = 50;
@@ -42,6 +42,19 @@ const MAX_SUMMARY_OUTPUT_TOKENS = 32768;
 // #574: bound on upstream summarization calls per invocation — the multi-range
 // walk can otherwise spend a call per viable range in a block-dense history.
 export const MAX_SUMMARY_CALLS_PER_PREFLIGHT = 16;
+
+// #869 review: coverage bound of the two depth budgets above. One round folds
+// ONE range and each fold removes at most CHUNK_FRACTION x window tokens (the
+// per-call chunk budget), so MAX_PREFLIGHT_ROUNDS rounds cover an overshoot of
+// at most MAX_PREFLIGHT_ROUNDS x CHUNK_FRACTION x window ~= 9.6x the window —
+// a payload of up to ~10.6x the window in the best case. Real coverage is
+// lower: a range smaller than the chunk budget saves less, and the #726
+// halving worklist can spend several calls on one range without completing a
+// fold. Beyond the bound the loop still exits cleanly — the fail-fast reports
+// the post-fold size and the remaining compressible-range count, so an
+// operator sees exactly how far the budget ran out. 16 is tuned to the
+// incident class behind #868 (a 1.39x-window payload); it is a fixed depth,
+// not scaled to the overshoot — scaling it is a separate design question.
 
 export type PreflightProtocol = "anthropic" | "openai" | "responses" | "google";
 
@@ -101,6 +114,12 @@ export interface PreflightResult {
      *  stale (e.g. a double-counted usage report, #300). The caller uses it
      *  to decide whether forwarding as-is is actually safe. */
     payloadEstimate: number;
+    /** Compressible ranges still visible in the kernel's final view after the
+     *  walk stopped — how much foldable headroom a deeper budget would find
+     *  (0 when nothing foldable remains). Surfaced in the fail-fast message
+     *  so an operator can see why the payload is still over the window
+     *  (#869 review). */
+    rangesRemaining: number;
     /** Whether the final payload fits the window, judged with the same
      *  measure the loop used: the optimistic token estimate for
      *  measured-baseline sessions (#300 — a stale HIGH baseline must not
@@ -281,17 +300,6 @@ function summaryPayload(protocol: PreflightProtocol, model: string, system: stri
     if (protocol === "openai") {
         return { model, max_tokens: maxOutputTokens, messages: [{ role: "system", content: system }, { role: "user", content }], stream };
     }
-    if (protocol === "google") {
-        // Gemini carries the model in the request PATH (never in the body) and
-        // has no `stream` field either — the `:streamGenerateContent` path
-        // decides. The summary call therefore carries only the conversation
-        // shape: contents + the system channel, with the output cap living in
-        // generationConfig (there is no top-level max_tokens).
-        const payload: Record<string, unknown> = { contents: [{ role: "user", parts: [{ text: content }] }] };
-        if (system) payload.systemInstruction = { parts: [{ text: system }] };
-        if (includeMaxOutputTokens) payload.generationConfig = { maxOutputTokens: MAX_SUMMARY_OUTPUT_TOKENS };
-        return payload;
-    }
     // #488: codex relays reject Responses calls without store:false ("Store must be set to false").
     // #663: max_output_tokens is optional — omit it once the upstream has
     // rejected the parameter (learned per URL+model); the model's default
@@ -355,30 +363,6 @@ function summaryHeaders(deps: PreflightDeps): Record<string, string> {
     return headers;
 }
 
-// Gemini carries the summary text in candidates[0].content.parts[].text. A
-// `thought:true` part is the model's reasoning (thinkingConfig), not summary
-// output, so it is skipped; several candidates only occur when n>1 is
-// requested, which the summary call never is — first candidate wins, mirroring
-// the OpenAI/Anthropic extractors.
-function googleChunkText(chunk: Record<string, unknown>): string {
-    const candidates = chunk.candidates;
-    if (!Array.isArray(candidates) || candidates.length === 0) return "";
-    const first = candidates[0];
-    if (!first || typeof first !== "object") return "";
-    const content = (first as Record<string, unknown>).content;
-    if (!content || typeof content !== "object") return "";
-    const parts = (content as Record<string, unknown>).parts;
-    if (!Array.isArray(parts)) return "";
-    let out = "";
-    for (const p of parts) {
-        if (!p || typeof p !== "object") continue;
-        const part = p as Record<string, unknown>;
-        if (part.thought === true) continue;
-        if (typeof part.text === "string") out += part.text;
-    }
-    return out;
-}
-
 // #780: extraction carries a validity contract — it must separate "the stream
 // delivered a complete summary" from "the stream died mid-delivery". The naive
 // accumulator conflated the two: a gateway truncation (#764: half-line data,
@@ -393,9 +377,8 @@ function googleChunkText(chunk: Record<string, unknown>): string {
 //     seen it is trusted as-is (no framing check on top, so gateways that close
 //     right after the final event without a trailing blank line are safe)
 //   - anthropic/openai do NOT require finish_reason/[DONE]/message_stop (#764:
-//     real gateways omit these occasionally), and the Gemini wire requires no
-//     finishReason either; the body must at least end on a frame boundary
-//     (\n\n, CRLF-tolerant), else it may have been cut mid-frame
+//     real gateways omit these occasionally); the body must at least end on a
+//     frame boundary (\n\n, CRLF-tolerant), else it may have been cut mid-frame
 // A rejected stream returns "" so requestSummary routes it into
 // diagnoseEmptySummary + the #726 halving/cooldown chain.
 export function extractSummaryFromSse(protocol: PreflightProtocol, text: string): string {
@@ -446,8 +429,6 @@ export function extractSummaryFromSse(protocol: PreflightProtocol, text: string)
                 const delta = (choices[0] as Record<string, unknown>).delta as Record<string, unknown> | undefined;
                 if (delta && typeof delta.content === "string") out += delta.content;
             }
-        } else if (protocol === "google") {
-            out += googleChunkText(o);
         } else {
             if (type === "response.output_text.delta" && typeof o.delta === "string") {
                 out += o.delta;
@@ -487,12 +468,6 @@ function extractSummaryText(protocol: PreflightProtocol, json: Record<string, un
             return c.map((p) => (p && typeof p === "object" && typeof (p as Record<string, unknown>).text === "string" ? (p as Record<string, string>).text : "")).join("");
         }
         return "";
-    }
-    if (protocol === "google") {
-        // Without `alt=sse` the same chunk objects arrive as a JSON ARRAY (the
-        // non-SSE streaming form), which the caller's JSON.parse hands us whole.
-        const chunks = Array.isArray(json) ? (json as unknown[]) : [json];
-        return chunks.map((c) => (c && typeof c === "object" ? googleChunkText(c as Record<string, unknown>) : "")).join("");
     }
     if (typeof json.output_text === "string") return json.output_text;
     const output = json.output;
@@ -688,16 +663,6 @@ async function requestSummaryBody(deps: PreflightDeps, body: string): Promise<st
     }
 }
 
-// #829: the body's shape decides how a summary reply is read, not the requested
-// `stream` flag. The flag covers upstreams that answer a stream:true call with
-// plain JSON; the mirror case is just as real — the Gemini wire posts its
-// summary call to the client's own `:streamGenerateContent` URL, which answers
-// SSE whatever the request says (the Gemini payload has no `stream` field to
-// turn it off). An SSE body that is never parsed reads as an empty summary, so
-// every call in the per-request budget is spent for nothing and the turn
-// fail-fasts with "context exceeds the model window" instead of compressing.
-const SSE_DATA_LINE_RE = /(?:^|\n)data:/;
-
 async function requestSummary(deps: PreflightDeps, system: string, content: string, stream: boolean, includeMaxOutputTokens: boolean): Promise<SummaryOutcome> {
     const text = await requestSummaryBody(deps, JSON.stringify(summaryPayload(deps.protocol, deps.model, system, content, stream, includeMaxOutputTokens, safeHost(deps.url))));
     let json: unknown;
@@ -707,15 +672,13 @@ async function requestSummary(deps: PreflightDeps, system: string, content: stri
         json = null;
     }
     // Streaming bodies are SSE, but a non-conforming upstream may answer a
-    // stream:true call with plain JSON — accept either shape, and likewise for
-    // a non-stream call answered with SSE (#829).
-    const sseBody = SSE_DATA_LINE_RE.test(text);
+    // stream:true call with plain JSON — accept either shape.
     const summary = (json && typeof json === "object"
         ? extractSummaryText(deps.protocol, json as Record<string, unknown>)
-        : stream || sseBody
+        : stream
             ? extractSummaryFromSse(deps.protocol, text)
             : "").trim();
-    if (!json && !stream && !sseBody) {
+    if (!json && !stream) {
         deps.log("warn", `[preflight] summary response was not JSON: ${text.slice(0, 200)}`);
     }
     if (summary.length < MIN_SUMMARY_CHARS) {
@@ -752,7 +715,7 @@ function noEmergencyTruncate(config: Config): Config {
 export async function preflightCompress(deps: PreflightDeps, messages: CoreMessage[]): Promise<PreflightResult> {
     const limit = deps.config.modelContextLimit;
     let target = Math.min(limit, deps.compressionTarget ?? limit);
-    const result: PreflightResult = { compressedRanges: 0, savedTokens: 0, payloadEstimate: estimateCoreMessages(messages) + (deps.imageFloor ?? 0) + (deps.wireOverhead ?? 0), fitsWindow: true };
+    const result: PreflightResult = { compressedRanges: 0, savedTokens: 0, payloadEstimate: estimateCoreMessages(messages) + (deps.imageFloor ?? 0) + (deps.wireOverhead ?? 0), rangesRemaining: 0, fitsWindow: true };
     if (limit <= 0) return result;
     const budget = Math.max(MIN_CHUNK_TOKENS, Math.floor(limit * CHUNK_FRACTION));
     // applyCompression rejects ranges below config.compress.minCompressRange
@@ -788,6 +751,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
     let summaryCalls = 0;
     let budgetHit = false;
     let rangesTried = 0;
+    let rangesRemaining = 0;
     for (let round = 0; round < MAX_PREFLIGHT_ROUNDS; round++) {
         if (deps.signal?.aborted) {
             failure = ABORTED_FAILURE;
@@ -825,6 +789,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
         if (startTokens < 0) startTokens = currentTokens;
         if (currentTokens < target) break;
         const ranges = viableRanges(turn.nudge?.compressibleRanges ?? []);
+        rangesRemaining = ranges.length;
         if (ranges.length === 0) {
             // #330: nothing foldable outside the soft-protected recent zone.
             // Relax the soft zone (oldest-first within it) and retry — the hard
@@ -999,6 +964,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             deps.session.stats.lastInputTokensSource = "estimate";
         }
     }
+    result.rangesRemaining = rangesRemaining;
     result.savedTokens = Math.max(0, startTokens - currentTokens);
     if (currentTokens >= limit) result.failure = failure;
     result.fitsWindow = baselineKnown ? result.payloadEstimate < limit : finalUpper < limit;

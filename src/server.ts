@@ -3165,12 +3165,20 @@ async function preflightCompressIfNeeded(
     // session.stats.lastInputTokens, which can be stale — e.g. a
     // double-counted usage report (#300) — and must not turn a fitting
     // payload into a fail-fast false positive.
-    const failFast = (status: number, detail: string, retryable: boolean): PreflightFailFast => {
+    // #869 review: quote the POST-FOLD size once folding happened — reporting
+    // only the original tokenCount reads as "nothing happened" even when 16
+    // folds removed hundreds of thousands of tokens. foldedTokens/rangesLeft
+    // stay undefined when no fold ran, so the original phrasing holds there.
+    const failFast = (status: number, detail: string, retryable: boolean, foldedTokens?: number, rangesLeft?: number): PreflightFailFast => {
         const imageNote = imageTokens >= limit
             ? ` Images alone account for ~${imageTokens} tokens (≥ window ${limit}); compression cannot remove them — shrink or remove the images, or raise the window.`
             : "";
+        const sizeClause = foldedTokens !== undefined && foldedTokens < tokenCount
+            ? `context ~${foldedTokens} tokens (down from ~${tokenCount} before preflight) exceeds the model window ${limit}`
+            : `context ~${tokenCount} tokens exceeds the model window ${limit}`;
+        const rangesClause = rangesLeft !== undefined ? `, with ${rangesLeft} compressible range(s) still visible` : "";
         const message =
-            `context ~${tokenCount} tokens exceeds the model window ${limit} (model=${model}) ` +
+            `${sizeClause} (model=${model})${rangesClause} ` +
             `and preflight compression could not bring it under: ${detail}.` +
             imageNote +
             ` The over-window payload was NOT forwarded.`;
@@ -3296,7 +3304,7 @@ async function preflightCompressIfNeeded(
     }
     const status = f?.kind === "upstream" && f.status === 429 ? 503 : 502;
     const retryable = f?.retryable === true || (f?.kind === "upstream" && f.status !== undefined && (f.status === 429 || f.status >= 500));
-    const ff = failFast(status, f?.detail ?? "the payload still exceeds the window after preflight compression", retryable);
+    const ff = failFast(status, f?.detail ?? "the payload still exceeds the window after preflight compression", retryable, result.compressedRanges > 0 ? session.stats.lastInputTokens : undefined, result.rangesRemaining);
     const contentDeadEnd = f?.kind === "exhausted" || (f?.kind === "upstream" && f.status !== undefined && f.status >= 400 && f.status < 500 && !retryable);
     if (contentDeadEnd && result.compressedRanges === 0) {
         const cooldownMs = preflightDeadEndCooldownMs();
