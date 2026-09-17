@@ -289,9 +289,9 @@ test("#568: non-stream + slow preflight → early 200 + whitespace keep-alive, t
             let parsed: { stream?: boolean; max_tokens?: number } = {};
             try { parsed = JSON.parse(raw); } catch { /* keep {} */ }
             calls.push({ raw });
-            // Summarization calls are sized to MAX_SUMMARY_OUTPUT_TOKENS (8192);
+            // Summarization calls are sized to MAX_SUMMARY_OUTPUT_TOKENS (32768);
             // the main request keeps its own max_tokens (1024).
-            if (parsed.max_tokens === 8192) {
+            if (parsed.max_tokens === 32768) {
                 setTimeout(() => {
                     res.writeHead(200, { "content-type": "application/json" });
                     res.end(JSON.stringify({ choices: [{ message: { role: "assistant", content: SUMMARY_TEXT } }] }));
@@ -330,7 +330,7 @@ test("#568: non-stream + slow preflight → early 200 + whitespace keep-alive, t
         const json = JSON.parse(r.body) as { choices?: Array<{ message?: { content?: string } }> };
         assert.equal(json.choices?.[0]?.message?.content, "ok", "the JSON body stays parseable despite the padding byte");
 
-        const forwards = calls.filter((c) => !c.raw.includes('"max_tokens":8192'));
+        const forwards = calls.filter((c) => !c.raw.includes('"max_tokens":32768'));
         assert.equal(forwards.length, 1, "exactly one forward upstream");
         assert.ok(forwards[0]!.raw.includes(SUMMARY_TEXT), "the rebuilt payload carries the preflight summary");
     } finally {

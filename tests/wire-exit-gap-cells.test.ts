@@ -159,7 +159,7 @@ function timedPost(url: string, headers: Record<string, string>, body: string): 
     });
 }
 
-/** Upstream whose summarization call (max_tokens 8192) is slow; the forward
+/** Upstream whose summarization call (max_tokens 32768) is slow; the forward
  *  call gets `forwardStatus` immediately. */
 function startUpstream(forwardStatus: number, forwardBody: string, summaryFails: boolean): Promise<{ server: http.Server; port: number; forwards: () => number }> {
     let forwards = 0;
@@ -170,7 +170,7 @@ function startUpstream(forwardStatus: number, forwardBody: string, summaryFails:
             const raw = Buffer.concat(chunks).toString("utf8");
             let parsed: { max_tokens?: number } = {};
             try { parsed = JSON.parse(raw); } catch { /* keep {} */ }
-            if (parsed.max_tokens === 8192) {
+            if (parsed.max_tokens === 32768) {
                 setTimeout(() => {
                     if (summaryFails) {
                         res.writeHead(429, { "content-type": "application/json" });

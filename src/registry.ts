@@ -241,6 +241,18 @@ export function peekRegistryContext(model: string, host?: string): number | unde
     return registryLookup(cache, model, host);
 }
 
+/** #853: synchronous cache-only OUTPUT-ceiling lookup for the preflight
+ *  summary cap. Same residency rules as peekRegistryContext: the cache is
+ *  pre-warmed with the bundled snapshot at module load (offline floor) and
+ *  upgrades to the disk cache / live models.dev data once loadRegistry runs
+ *  (server traffic resolves windows, warming it) — so this never fetches,
+ *  never blocks, and never returns stale-beyond-the-last-registry-sync data.
+ *  Callers clamp their own default against the result; undefined = no known
+ *  ceiling. */
+export function peekRegistryOutputLimit(model: string, host?: string): number | undefined {
+    return registryLookup(cache, model, host, "output");
+}
+
 /** Test-only escape hatch: raw access to the bundled snapshot registry
  *  (for asserting the snapshot ships full entries, not projections). */
 export function bundledRegistryForTestsOnly(): RegistryShape | null {
@@ -252,6 +264,13 @@ export function bundledRegistryForTestsOnly(): RegistryShape | null {
  *  the offline floor actually ships). */
 export function bundledSnapshotLookup(model: string, host?: string): number | undefined {
     return registryLookup(bundledSnapshotRegistry(), model, host);
+}
+
+/** Bundled-snapshot-only output ceiling (#853) — the offline floor a fresh
+ *  install resolves before any cache exists. Exposed for tests/diagnostics
+ *  (what ships in the box), like bundledSnapshotLookup above. */
+export function bundledSnapshotOutputLimit(model: string, host?: string): number | undefined {
+    return registryLookup(bundledSnapshotRegistry(), model, host, "output");
 }
 
 // Inference-mode suffixes denoting the SAME base model under a different
@@ -286,7 +305,9 @@ export function modelVariants(name: string): string[] {
     return variants;
 }
 
-function registryLookup(reg: RegistryShape | null, model: string, host?: string): number | undefined {
+function registryLookup(reg: RegistryShape | null, model: string, host: string | undefined, field: "context" | "output"): number | undefined;
+function registryLookup(reg: RegistryShape | null, model: string, host?: string): number | undefined;
+function registryLookup(reg: RegistryShape | null, model: string, host?: string, field: "context" | "output" = "context"): number | undefined {
     if (!reg || !model) return undefined;
     const provider = host ? providerFromHost(host) : undefined;
     // Relay/vLLM deployments serve models under arbitrary "prefix/name" ids
@@ -309,8 +330,8 @@ function registryLookup(reg: RegistryShape | null, model: string, host?: string)
         const candidates = provider ? [`${provider}/${name}`, name] : [name];
         for (const key of candidates) {
             const entry = reg[key];
-            const ctx = entry?.limit?.context;
-            if (typeof ctx === "number" && ctx > 0) return ctx;
+            const value = entry?.limit?.[field];
+            if (typeof value === "number" && value > 0) return value;
         }
         // Relay host (not in HOST_TO_PROVIDER): the bare name can miss while
         // the model exists under a provider-prefixed key (a relay serving
@@ -330,16 +351,16 @@ function registryLookup(reg: RegistryShape | null, model: string, host?: string)
             const parts: string[] = [];
             for (const key of Object.keys(reg)) {
                 if (!key.endsWith(suffix)) continue;
-                const ctx = reg[key].limit?.context;
-                if (typeof ctx !== "number" || ctx <= 0) continue;
-                if (max === undefined || ctx > max) max = ctx;
-                distinct.add(ctx);
-                parts.push(`${key}=${ctx}`);
+                const value = reg[key].limit?.[field];
+                if (typeof value !== "number" || value <= 0) continue;
+                if (max === undefined || value > max) max = value;
+                distinct.add(value);
+                parts.push(`${key}=${value}`);
             }
             if (max !== undefined) {
                 if (distinct.size > 1 && !warnedConflicts.has(name)) {
                     warnedConflicts.add(name);
-                    loggerLog("warn", `[acp-registry] conflicting context windows for "${name}" (${parts.join(", ")}) — using max ${max}`);
+                    loggerLog("warn", `[acp-registry] conflicting ${field === "context" ? "context windows" : "output ceilings"} for "${name}" (${parts.join(", ")}) — using max ${max}`);
                 }
                 return max;
             }

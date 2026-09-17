@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import http from "node:http";
+import os from "node:os";
+import path from "node:path";
 import { once } from "node:events";
 import test from "node:test";
 
@@ -78,7 +80,7 @@ async function startRig(inputTokens = 500, log = false): Promise<Rig> {
         promptCache: { routing: "auto" },
         sessionHeader: "x-acp-session",
         log,
-        logFile: log ? "/tmp/issue-393-test.log" : undefined,
+        logFile: log ? path.join(os.tmpdir(), "issue-393-test.log") : undefined,
         debug: false,
         passthrough: false,
         autoUpdate: false,

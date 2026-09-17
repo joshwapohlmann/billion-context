@@ -68,6 +68,14 @@ export function proxyOriginFile(): string {
     return path.join(stateDir(), "proxy-origin");
 }
 
+/** Body-dump dir (ACP_DUMP_BODY / BILI_DUMP_4XX): ACP_DUMP_DIR override first,
+ *  else the XDG state dir so dumps co-locate with bili.log on every platform. */
+export function dumpsDir(): string {
+    const env = process.env.ACP_DUMP_DIR;
+    if (env && env.length > 0) return env;
+    return path.join(stateDir(), "dumps");
+}
+
 /** CA dir: root CA + dynamically-signed host certificates for MITM mode.
  *  Lives under the data dir (the private key is sensitive but regenerable).
  *  Created lazily by ca.ts on first MITM use. */

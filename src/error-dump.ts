@@ -1,5 +1,6 @@
 import fs from "node:fs";
-import { stateDir } from "./paths.js";
+import path from "node:path";
+import { dumpsDir } from "./paths.js";
 import { log as loggerLog } from "./logger.js";
 
 // #762: when the upstream rejects the forwarded body (4xx), persist the exact
@@ -42,10 +43,10 @@ export function dumpRejectedBody(status: number, sessionId: string, body: string
                 text = raw;
             }
         }
-        const dir = process.env.ACP_DUMP_DIR || `${stateDir()}/dumps`;
+        const dir = dumpsDir();
         fs.mkdirSync(dir, { recursive: true });
         const sid = sessionId.replace(/[^a-zA-Z0-9_-]/g, "_");
-        const out = `${dir}/err-${Date.now()}-${sid}-${status}.json`;
+        const out = path.join(dir, `err-${Date.now()}-${sid}-${status}.json`);
         fs.writeFileSync(out, `${text}${marker}`);
         loggerLog("info", `[dump] upstream ${status} rejected body written to ${out}`);
         return out;

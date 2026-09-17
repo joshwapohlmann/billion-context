@@ -19,7 +19,7 @@ import { listSessions } from "../src/session.ts";
 // max_output_tokens"}), which killed preflight summaries with a 502 after the
 // #626 stream fix. The proxy must detect the rejection, retry the
 // summarization without the optional parameter, and remember it per
-// session+upstream+model — so a model that accepts the limit keeps the 8192
+// session+upstream+model — so a model that accepts the limit keeps the 32768
 // cap. Both rejection orders (stream-first, max_output_tokens-first) must
 // recover, and standard providers must be untouched.
 
@@ -271,7 +271,7 @@ test("e2e #663 (order B, param-first): max_output_tokens rejected before stream 
     }
 });
 
-// Standard Responses provider: accepts max_output_tokens — the 8192 cap must
+// Standard Responses provider: accepts max_output_tokens — the 32768 cap must
 // be retained on every summary call, and NO capability may be learned.
 function makeStandardUpstream(calls: Call[]): http.Server {
     return http.createServer((req, res) => {
@@ -304,8 +304,8 @@ test("e2e #663 (standard provider): max_output_tokens retained, no capability le
         const summaries = calls.filter((c) => c.summary);
         assert.ok(summaries.length >= 1, "preflight summaries happened");
         assert.ok(
-            summaries.every((c) => c.maxOutputTokens === 8192),
-            `every summary must keep the 8192 output limit, got ${JSON.stringify(summaries)}`,
+            summaries.every((c) => c.maxOutputTokens === 32768),
+            `every summary must keep the 32768 output limit, got ${JSON.stringify(summaries)}`,
         );
         assert.ok(calls.some((c) => !c.summary), "the folded payload was forwarded");
 
@@ -332,7 +332,7 @@ function makeModelSplitUpstream(calls: Call[]): http.Server {
     });
 }
 
-test("e2e #663 (model scoping): rejection learned for model A keeps model B's 8192 cap", async () => {
+test("e2e #663 (model scoping): rejection learned for model A keeps model B's 32768 cap", async () => {
     const calls: Call[] = [];
     const upstream = makeModelSplitUpstream(calls);
     upstream.listen(0, "127.0.0.1");
@@ -352,7 +352,7 @@ test("e2e #663 (model scoping): rejection learned for model A keeps model B's 81
         // cap (rejected), then every retry — however many folds the payload
         // needs — is non-stream without the cap.
         assert.ok(astraSummaries.length >= 2, `model A: one rejected attempt + at least one retry, got ${JSON.stringify(astraSummaries)}`);
-        assert.equal(astraSummaries[0].maxOutputTokens, 8192, "model A first attempt carries the cap");
+        assert.equal(astraSummaries[0].maxOutputTokens, 32768, "model A first attempt carries the cap");
         assert.ok(
             astraSummaries.slice(1).every((c) => c.maxOutputTokens === undefined),
             `every model A retry must drop the cap, got ${JSON.stringify(astraSummaries)}`,
@@ -366,8 +366,8 @@ test("e2e #663 (model scoping): rejection learned for model A keeps model B's 81
         const standardSummaries = calls.slice(callsBefore).filter((c) => c.summary);
         assert.ok(standardSummaries.length >= 1, "second request triggered preflight summaries");
         assert.ok(
-            standardSummaries.every((c) => c.model === "gpt-6-standard" && c.maxOutputTokens === 8192),
-            `model B summaries must keep the 8192 cap, got ${JSON.stringify(standardSummaries)}`,
+            standardSummaries.every((c) => c.model === "gpt-6-standard" && c.maxOutputTokens === 32768),
+            `model B summaries must keep the 32768 cap, got ${JSON.stringify(standardSummaries)}`,
         );
 
         const sess = listSessions().find((s) => s.id.includes("s663-resp-d"));
