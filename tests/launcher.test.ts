@@ -99,8 +99,33 @@ import { _setForTest as registrySetForTest, _resetForTest as registryResetForTes
 // — point the state dir at a throwaway so these tests never touch the real one.
 const prevXdgState = process.env.XDG_STATE_HOME;
 process.env.XDG_STATE_HOME = fs.mkdtempSync(path.join(os.tmpdir(), "bili-launcher-state-"));
+// A host harness that launches bili (omp, codex, claude) exports its client binary,
+// its proxy URL and its CA into every child process. Inherited here they change what
+// runLaunch launches, because BILI_CLIENT_BIN outranks `client: "pi"`
+// (src/launcher.ts:2190), so the injected spawnImpl never matches the fake client and
+// never fires the `exit` this file waits on, hanging the test with no timer or socket
+// left to trace; and they change what the assertions read back from the launched env,
+// where trae then sees NODE_EXTRA_CA_CERTS and kimi sees BILLION_CONTEXT_PROXY.
+const inheritedLaunchVars = [
+    "BILI_CLIENT_BIN",
+    "BILLION_CONTEXT_PROXY",
+    "NODE_EXTRA_CA_CERTS",
+    "SSL_CERT_FILE",
+    "HTTPS_PROXY",
+    "HTTP_PROXY",
+];
+const prevInheritedLaunchVars: Record<string, string | undefined> = {};
+for (const name of inheritedLaunchVars) {
+    prevInheritedLaunchVars[name] = process.env[name];
+    delete process.env[name];
+}
 after(() => {
     removeStartingMarker();
+    for (const name of inheritedLaunchVars) {
+        const value = prevInheritedLaunchVars[name];
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+    }
     if (prevXdgState === undefined) delete process.env.XDG_STATE_HOME;
     else process.env.XDG_STATE_HOME = prevXdgState;
 });
